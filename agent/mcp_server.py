@@ -59,7 +59,8 @@ AGENT_DIR = Path(__file__).resolve().parent
 if str(AGENT_DIR) not in sys.path:
     sys.path.insert(0, str(AGENT_DIR))
 
-from fastmcp import Context, FastMCP
+from fastmcp.server.context import Context
+from fastmcp.server.server import FastMCP
 from cli._version import __version__ as APP_VERSION
 from src.market_data import (
     DEFAULT_MAX_ROWS,
