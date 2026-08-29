@@ -70,7 +70,6 @@ if str(AGENT_DIR) not in sys.path:
 
 from fastmcp import Context, FastMCP
 from pydantic import BeforeValidator
-
 from cli._version import __version__ as APP_VERSION
 from src.market_data import (
     DEFAULT_MAX_ROWS,

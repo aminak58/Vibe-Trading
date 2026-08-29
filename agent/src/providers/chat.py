@@ -308,6 +308,8 @@ class ChatLLM:
             LLMResponse.
         """
         llm = self._llm.bind_tools(tools) if tools else self._llm
+        if timeout is None:
+            timeout = int(os.environ.get("TIMEOUT_SECONDS", "120") or "120")
         config = {"timeout": timeout} if timeout else {}
         ai_message = llm.invoke(messages, config=config)
         return self._parse_response(ai_message)
@@ -342,6 +344,8 @@ class ChatLLM:
         """
         try:
             llm = self._llm.bind_tools(tools) if tools else self._llm
+            if timeout is None:
+                timeout = int(os.environ.get("TIMEOUT_SECONDS", "120") or "120")
             config = {"timeout": timeout} if timeout else {}
             accumulated = None
             pending_text = ""

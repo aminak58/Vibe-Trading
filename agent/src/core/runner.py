@@ -569,7 +569,12 @@ class Runner:
             )
         if sandbox_home is not None:
             env["HOME"] = str(sandbox_home)
-            env["USERPROFILE"] = str(sandbox_home)
+            # USERPROFILE is deliberately NOT sandboxed: the MetaTrader5 SDK's
+            # IPC attach fails with error -10003 when USERPROFILE points at an
+            # ephemeral directory, which made source="mt5" unavailable inside
+            # backtest subprocesses (silently falling back to non-broker
+            # sources). The AST scrubber above remains the primary gate for
+            # generated code; HOME stays sandboxed for HOME-based lookups.
             # Keep well-behaved (platformdirs) library caches persistent so the
             # ephemeral HOME does not force a full re-download every run.
             if real_home is not None:

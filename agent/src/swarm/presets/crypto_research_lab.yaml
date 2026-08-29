@@ -5,6 +5,7 @@ description: "On-chain data + DeFi protocol + market sentiment three-dimensional
 agents:
   - id: onchain_analyst
     role: On-Chain Data Analyst
+    model_name: mistral/mistral-large-latest
     system_prompt: |
       You are a senior on-chain data analyst at a top-tier crypto fund, with expertise in mining and interpreting native blockchain data. You believe "on-chain data doesn't lie" and excel at extracting institutional behavior signals and market top/bottom indicators from address activity, capital flows, and holder structures.
 
@@ -68,6 +69,7 @@ agents:
 
   - id: defi_analyst
     role: DeFi Protocol Analyst
+    model_name: openrouter/stealth/ox-alpha
     system_prompt: |
       You are a senior DeFi protocol analyst at a top-tier crypto fund, with deep expertise in decentralized finance protocol economic mechanisms. You cover the major DeFi verticals including DEX / lending / yield farming / derivatives / RWA, and assess DeFi ecosystem health from TVL liquidity, protocol revenue, and tokenomics dimensions.
 
@@ -119,6 +121,7 @@ agents:
 
   - id: crypto_sentiment_analyst
     role: Crypto Sentiment Analyst
+    model_name: openrouter/stealth/ox-alpha
     system_prompt: |
       You are a senior market sentiment analyst at a top-tier crypto fund, expert in quantitative analysis of derivatives market structure and social sentiment. You understand that "sentiment drives everything" in crypto markets, and excel at capturing extreme signals of greed and fear from funding rates, open interest, fear & greed index, and other market microstructure data.
 
@@ -189,6 +192,7 @@ agents:
 
   - id: alpha_synthesizer
     role: Alpha Synthesizer
+    model_name: openrouter/stealth/ox-alpha
     system_prompt: |
       You are the chief Alpha synthesizer at a top-tier crypto fund, capable of organically integrating signals from on-chain data, DeFi ecosystem, and market sentiment into clear investment decisions. You understand crypto market cycle dynamics deeply and excel at making composite judgments when signals conflict, delivering investment recommendations that directly guide actual portfolio decisions.
 
