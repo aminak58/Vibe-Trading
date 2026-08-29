@@ -146,11 +146,26 @@ _GENERIC_PRICE_FIELD_ALIASES = {
 # Project-style canonical symbols. A bare model-generated ticker is still
 # checked when it appears under a symbol argument key, but it is not accepted
 # as user-provided identity because it lacks venue information.
+#
+# A joined crypto pair (``BTCUSDT``, ``ETHUSDT`` …) is recognized alongside
+# the dashed/slashed form so a request like "current BTCUSDT spot price"
+# surfaces an asserted identity before the resolver runs. Without this
+# branch, the resolver's first call was the only chance to lock the
+# instrument, and a free-text Yahoo search then answered it with an
+# ETP listing (e.g. ``VALOUR-BTC-0-SEK.ST``) instead of the spot pair.
+# The base is restricted to alpha so a numeric prefix cannot masquerade
+# as a joined pair and the dash/slash branch keeps matching real pairs.
+_JOINED_CRYPTO_QUOTE_SUFFIXES = ("USDT", "USDC", "BUSD", "DAI", "TUSD")
+_JOINED_CRYPTO_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 _CANONICAL_SYMBOL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"\d{3,6}\.(?:SH|SZ|BJ|SS|HK|KS|KQ)|"
     r"[A-Z][A-Z0-9&.-]{0,19}\.(?:US|NS|BO|FX|TO|V)|"
     r"[A-Z0-9]{2,15}(?:-|/)(?:USDT|USDC|USD|BTC|ETH)|"
+    r"[A-Z]{2,15}(?:" + "|".join(_JOINED_CRYPTO_QUOTE_SUFFIXES) + r")|"
     r"[A-Z0-9]{2,15}=[FX]"
     r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
@@ -499,8 +514,10 @@ def _normalize_symbol(value: Any) -> str:
     Returns:
         The canonical spelling — uppercased, with Shanghai's ``.SS`` alias
         folded onto ``.SH``, an exchange prefix rewritten as a suffix, a Hong
-        Kong code zero-padded, and a crypto pair hyphenated. Text that is not a
-        symbol is returned uppercased and otherwise untouched.
+        Kong code zero-padded, and a crypto pair hyphenated. A joined crypto
+        pair with no separator (``BTCUSDT``) is rewritten as the dashed form
+        (``BTC-USDT``) so every downstream check sees one identity. Text that
+        is not a symbol is returned uppercased and otherwise untouched.
     """
     symbol = str(value or "").strip().upper().replace("/", "-")
     if not symbol:
@@ -510,6 +527,17 @@ def _normalize_symbol(value: Any) -> str:
         return f"{prefixed.group(2)}.{prefixed.group(1)}"
     base, dot, suffix = symbol.rpartition(".")
     if not dot:
+        # No separator at all: treat a joined crypto pair (``BTCUSDT``) as a
+        # dashed pair so it matches the canonical regex and the dash/slash
+        # branch. The base must be all-alpha so a numeric prefix cannot
+        # collide with another numeric-code branch downstream.
+        joined = _JOINED_CRYPTO_RE.fullmatch(symbol)
+        if joined:
+            for quote in _JOINED_CRYPTO_QUOTE_SUFFIXES:
+                if symbol.endswith(quote) and len(symbol) > len(quote):
+                    base_part = symbol[: -len(quote)]
+                    if base_part.isalpha():
+                        return f"{base_part}-{quote}"
         return symbol
     if suffix == "SS":
         suffix = "SH"
@@ -733,6 +761,77 @@ def _infer_instrument_type(symbol: str, candidate_type: Any = None) -> str:
     if "-" in upper or "/" in upper:
         return "crypto"
     return "listed_security"
+
+
+# Provider ``quoteType`` values that mark a Yahoo-resolved instrument as a
+# spot crypto pair rather than an ETP or equity wrapper around the same
+# underlying asset. ``CRYPTOCURRENCY`` is the documented value; the others
+# are defensive fallbacks for providers that vary the spelling.
+_CRYPTO_QUOTE_TYPES = frozenset(
+    {"cryptocurrency", "crypto", "digitalcurrency", "coin"}
+)
+
+
+def _candidate_is_crypto(candidate: Mapping[str, Any]) -> bool:
+    """Whether a resolver candidate is unambiguously a spot crypto pair.
+
+    The symbol shape alone is not enough: ``VALOUR-BTC-0-SEK.ST`` contains
+    a hyphen and is mis-classified as ``crypto`` by
+    :func:`_infer_instrument_type`. The reliable signals are (in priority
+    order): a ``quoteType`` of CRYPTOCURRENCY, a ``market`` label of
+    ``crypto`` already attached by the resolver tool, or a project-shape
+    crypto symbol whose quote currency is one of the well-known stablecoins
+    / quote tokens (``USDT``/``USDC``/``USD``/``BUSD``/``DAI``/``TUSD``).
+    An ETP symbol carrying a national exchange suffix (``ST``, ``OL``,
+    ``LSE``, ``AS``) is never re-classified as crypto even if its long
+    name contains ``Bitcoin`` or ``Ethereum``.
+    """
+    quote_type = str(candidate.get("type") or "").strip().casefold()
+    if quote_type in _CRYPTO_QUOTE_TYPES:
+        return True
+    market = str(candidate.get("market") or "").strip().casefold()
+    if market == "crypto":
+        return True
+    symbol = _normalize_symbol(candidate.get("symbol"))
+    if not symbol:
+        return False
+    # ETP/equity venues must never be auto-classified as crypto. A leading
+    # national-exchange suffix (.ST / .OL / .LSE / .AS / .MI / .PA / .DE /
+    # .F / .MU / .HM / .HA / .BE / .DU / .STU / .SG / .SW / .VX / .BR / .TA)
+    # marks a non-crypto listing whose long name may still mention BTC/ETH.
+    equity_venues = (".ST", ".OL", ".LSE", ".AS", ".MI", ".PA", ".DE", ".F",
+                     ".MU", ".HM", ".HA", ".BE", ".DU", ".STU", ".SG", ".SW",
+                     ".VX", ".BR", ".TA", ".TO", ".V", ".US", ".NS", ".BO",
+                     ".SH", ".SZ", ".BJ", ".HK", ".KS", ".KQ")
+    if any(symbol.upper().endswith(suf) for suf in equity_venues):
+        return False
+    # Project-shape crypto: a quoted currency from the stablecoin / quote
+    # list signals a spot pair. The base must be alphabetic so a numeric
+    # code (e.g. ``000001``) cannot pass.
+    if "-" in symbol:
+        base, _, quote = symbol.partition("-")
+        if base.isalpha() and quote in _JOINED_CRYPTO_QUOTE_SUFFIXES + ("USD",):
+            return True
+    return False
+
+
+def _query_implies_crypto(query: str) -> bool:
+    """Whether a resolver query is asking about a crypto pair, not an ETP.
+
+    A query shape that contains a canonical crypto symbol (any spelling — see
+    :data:`_CANONICAL_SYMBOL_RE`) is treated as a crypto request: the model
+    spelled out an instrument on a venue that the rest of this module
+    understands as crypto, so locking an ETP would contradict that assertion.
+    Bare crypto bases (``BTC``, ``ETH``, ``SOL`` …) alone are deliberately not
+    enough — they appear in many ETP long names (``"Bitcoin Zero"``) and
+    would over-fire on the very query that triggered this fix.
+    """
+    if not query:
+        return False
+    return any(
+        _infer_instrument_type(symbol) == "crypto"
+        for symbol in _scan_symbols(query)
+    )
 
 
 @dataclass(frozen=True)
@@ -1419,7 +1518,7 @@ class GroundingLedger:
                 str(name)
                 for name, value in sources.items()
                 if str(value).casefold() != "ok"
-                and not str(value).casefold().startswith("skipped")
+                    and not str(value).casefold().startswith("skipped")
             ]
             self._identities[key] = IdentityRecord(
                 query=query,
@@ -1427,6 +1526,31 @@ class GroundingLedger:
                 source_tool_call_id=call_id,
                 source=clean_sources,
                 candidates=[],
+                version=version,
+            )
+            return
+
+        # Cross-asset identity guard for crypto queries. When the user query
+        # contains a canonical crypto symbol (e.g. ``BTCUSDT``, ``BTC-USDT``,
+        # ``BTC/USDT``), a resolver answer that names an ETP/equity listing of
+        # the same underlying asset contradicts that assertion. Locking such a
+        # row would silently switch the run's authorized identity to a
+        # Swedish/American ETP and every downstream market-data call would
+        # be rejected as ``identity_mismatch``. Surfacing this as
+        # ``conflicting`` instead lets the recovery prompt steer the model
+        # back to ``search_symbol`` with a clearly crypto-spelled query.
+        if _query_implies_crypto(query) and candidates and not any(
+            _candidate_is_crypto(c) for c in candidates
+        ):
+            asserted = sorted(_scan_symbols(query))
+            conflicting = list(candidates) + [
+                {"symbol": item, "source": ["query"]} for item in asserted
+            ]
+            self._identities[key] = IdentityRecord(
+                query=query,
+                status="conflicting",
+                source_tool_call_id=call_id,
+                candidates=conflicting,
                 version=version,
             )
             return
@@ -1537,13 +1661,23 @@ class GroundingLedger:
         that differ only by a provider's suffix convention describe one listing,
         and counting them as rival candidates is what left every Shanghai query
         with two "exact" matches and therefore no choice at all.
+
+        When the query implies a crypto pair (e.g. ``BTCUSDT``), a single-row
+        answer that is *not* a crypto quote is rejected so an ETP listing
+        cannot be auto-locked for a spot request. The caller treats that as
+        ``ambiguous`` and recovers through ``search_symbol`` with the
+        dashed/slashed spelling, which the canonical-symbol change now
+        surfaces as an asserted identity.
         """
         by_symbol: dict[str, dict[str, Any]] = {}
         for candidate in candidates:
             by_symbol.setdefault(_normalize_symbol(candidate.get("symbol")), candidate)
         candidates = list(by_symbol.values())
         if len(candidates) == 1:
-            return candidates[0]
+            only = candidates[0]
+            if _query_implies_crypto(query) and not _candidate_is_crypto(only):
+                return None
+            return only
         normalized_query = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", query.casefold())
         exact: list[dict[str, Any]] = []
         strong: list[dict[str, Any]] = []

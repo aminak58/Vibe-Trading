@@ -132,8 +132,10 @@ class TestSymbolSearchSuccess:
         assert aapl["cik"] == "0000320193"
         assert "yahoo" in aapl.get("also_from", [])
 
-        # Crypto keeps its native Yahoo symbol and a global market label.
-        assert by_symbol["BTC-USD"]["market"] == "global"
+        # Crypto keeps its native Yahoo symbol and is now labelled by
+        # ``quoteType`` (CRYPTOCURRENCY -> crypto) so the resolver can prefer
+        # it over an ETP/equity listing with the same base.
+        assert by_symbol["BTC-USD"]["market"] == "crypto"
 
         # Unmappable Eastmoney market dropped; empty Yahoo symbol dropped.
         assert "BK0001" not in by_symbol
@@ -587,3 +589,61 @@ class TestTickerNameQueryYahooSkip:
 
         search.assert_called_once()
         assert data["sources"]["yahoo"] == "ok"
+
+
+class TestYahooQuoteTypeMapping:
+    """``quoteType`` drives the market label so the resolver can prefer
+    crypto over ETPs that wrap the same underlying asset.
+
+    Regression for the BTCUSDT identity-resolution bug: Yahoo's free-text
+    search answers ``BTCUSDT`` with the Swedish listed ETP
+    ``VALOUR-BTC-0-SEK.ST`` (whose long name contains "Bitcoin Zero").
+    Without a quoteType-aware label the resolver cannot tell an ETP from a
+    spot pair and locks the wrong instrument.
+    """
+
+    def test_cryptocurrency_quote_is_labelled_crypto(self):
+        """A ``quoteType=CRYPTOCURRENCY`` Yahoo row surfaces as ``crypto``."""
+        quotes = [
+            {
+                "symbol": "BTC-USD",
+                "shortname": "Bitcoin USD",
+                "exchange": "CCC",
+                "quoteType": "CRYPTOCURRENCY",
+            }
+        ]
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.yahoo_client, "search", return_value=quotes):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="BTCUSDT")
+            )["data"]
+
+        symbols = {c["symbol"]: c for c in data["candidates"]}
+        assert symbols["BTC-USD"]["market"] == "crypto"
+        assert symbols["BTC-USD"]["type"] == "cryptocurrency"
+
+    def test_etp_quote_is_labelled_etp(self):
+        """A ``quoteType=ETF`` Yahoo row surfaces as ``etp`` for downstream
+        discrimination against spot crypto."""
+        quotes = [
+            {
+                "symbol": "VALOUR-BTC-0-SEK.ST",
+                "shortname": "Valour Bitcoin Zero SEK",
+                "exchange": "STO",
+                "quoteType": "EQUITY",
+            }
+        ]
+        with patch.object(
+            ss.eastmoney_client,
+            "get_json",
+            return_value={"QuotationCodeTable": {"Data": []}},
+        ), patch.object(ss.yahoo_client, "search", return_value=quotes):
+            data = json.loads(
+                ss.SymbolSearchTool().execute(query="BTCUSDT")
+            )["data"]
+
+        symbols = {c["symbol"]: c for c in data["candidates"]}
+        assert symbols["VALOUR-BTC-0-SEK.ST"]["market"] == "global"

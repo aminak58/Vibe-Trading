@@ -405,6 +405,13 @@ def _yahoo_candidate(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     convention (``AAPL.US`` / ``00700.HK`` / ``TD.TO`` / ``PNG.V``) and leave
     other instruments (crypto, indices, FX) on their native Yahoo symbol.
 
+    ``quoteType`` drives the ``market`` label so the resolver can prefer a
+    crypto pair over an ETP/equity listing when the query implies crypto.
+    Without this mapping, a single-row resolver answer for ``BTCUSDT``
+    looked the same whether Yahoo returned ``BTC-USD`` (cryptocurrency) or
+    ``VALOUR-BTC-0-SEK.ST`` (equity) — the latter locked the run to a
+    Swedish Bitcoin ETP instead of the spot pair.
+
     Args:
         quote: One element of Yahoo search's ``quotes`` list.
 
@@ -418,6 +425,25 @@ def _yahoo_candidate(quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     name = (
         str(quote.get("shortname") or quote.get("longname") or "").strip() or None
     )
+    quote_type = str(quote.get("quoteType") or "").strip().casefold()
+    # ``_from_yahoo_symbol`` may already have set ``market`` for a known
+    # project venue (.HK / .TO / .V / .SH / .SZ / .BJ / .US). Only override
+    # the label when the venue is the catch-all ``global`` so a US equity
+    # path stays ``us`` and an HK path stays ``hk``.
+    if market == "global":
+        type_to_market = {
+            "cryptocurrency": "crypto",
+            "crypto": "crypto",
+            "digitalcurrency": "crypto",
+            "coin": "crypto",
+            "etf": "etp",
+            "fund": "etp",
+            "trust": "etp",
+            "index": "index",
+            "future": "futures",
+            "currency": "forex",
+        }
+        market = type_to_market.get(quote_type, market)
     return {
         "symbol": symbol,
         "name": name,

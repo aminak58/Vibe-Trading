@@ -14,6 +14,7 @@ from src.agent.grounding import (
     GroundingLedger,
     _infer_currency,
     _infer_venue,
+    _normalize_symbol,
     _scan_symbols,
 )
 from src.agent.loop import AgentLoop, _is_tool_success
@@ -361,6 +362,13 @@ def test_bare_ticker_stays_blocked_when_it_names_more_than_one_identity(
         ("00700.HK", "700.HK"),
         ("00700.HK", "0700.HK"),
         ("BTC-USDT", "BTC/USDT"),
+        # Joined crypto pairs (no separator) are the same identity as the
+        # dashed/slashed spelling. Without this, a ``BTCUSDT`` query never
+        # matches a locked ``BTC-USDT`` and the gate rejects every OHLCV
+        # call as ``identity_mismatch``.
+        ("BTC-USDT", "BTCUSDT"),
+        ("ETH-USDT", "ETHUSDT"),
+        ("BTC-USDC", "BTCUSDC"),
     ],
 )
 def test_provider_spellings_of_one_instrument_are_one_identity(
@@ -380,6 +388,183 @@ def test_provider_spellings_of_one_instrument_are_one_identity(
 
     assert ledger.authorized_symbols == {locked}
     assert authorization.allowed is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("BTCUSDT", "BTC-USDT"),
+        ("ETHUSDT", "ETH-USDT"),
+        ("SOLUSDT", "SOL-USDT"),
+        ("BTCUSDC", "BTC-USDC"),
+        ("ETHUSDC", "ETH-USDC"),
+        ("BTCUSDT.P", "BTCUSDT.P"),  # TradingView perpetual not auto-split
+        ("VALOUR-BTC-0-SEK.ST", "VALOUR-BTC-0-SEK.ST"),  # ETP shape unchanged
+        ("btcusdt", "BTC-USDT"),  # case-insensitive
+        ("AAPL.US", "AAPL.US"),  # not a crypto pair
+        ("600519.SH", "600519.SH"),  # not a crypto pair
+    ],
+)
+def test_normalize_joined_crypto_pairs(raw: str, expected: str) -> None:
+    """A joined crypto pair (no separator) normalizes to its dashed form."""
+    assert _normalize_symbol(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("BTCUSDT", {"BTC-USDT"}),
+        ("BTCUSDT spot price", {"BTC-USDT"}),
+        ("ETH/USDT latest price", {"ETH-USDT"}),
+        ("BTC-USDT close", {"BTC-USDT"}),
+        ("BTCUSDT, ETH-USDT, BTC-USD", {"BTC-USDT", "ETH-USDT", "BTC-USD"}),
+    ],
+)
+def test_scan_symbols_detects_joined_pairs(text: str, expected: set[str]) -> None:
+    """A bare joined crypto pair is scanned as the canonical symbol."""
+    assert _scan_symbols(text) == expected
+
+
+def test_resolver_does_not_lock_etp_for_joined_crypto_query(tmp_path: Path) -> None:
+    """A ``BTCUSDT`` query must not auto-lock a Swedish Bitcoin ETP.
+
+    Regression for the BTCUSDT identity-resolution bug: Yahoo's free-text
+    search answers ``BTCUSDT`` with the Swedish listed ETP
+    ``VALOUR-BTC-0-SEK.ST`` (whose long name contains "Bitcoin Zero") as
+    the only row. The resolver must refuse to lock that as the run's
+    instrument identity — a downstream ``get_market_data(codes=["BTC-USDT"])``
+    would otherwise be rejected as ``identity_mismatch``.
+    """
+    resolver_payload = json.dumps(
+        {
+            "ok": True,
+            "source": "symbol_search",
+            "data": {
+                "query": "BTCUSDT",
+                "count": 1,
+                "candidates": [
+                    {
+                        "symbol": "VALOUR-BTC-0-SEK.ST",
+                        "name": "Valour Bitcoin Zero SEK",
+                        "market": "global",
+                        "type": "EQUITY",
+                        "exchange": "STO",
+                        "source": "yahoo",
+                    }
+                ],
+                "sources": {"eastmoney": "ok", "yahoo": "ok"},
+            },
+        },
+        ensure_ascii=False,
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Get BTCUSDT spot price",
+    )
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "BTCUSDT"},
+        result=resolver_payload,
+        call_id="resolve-btcusdt",
+        success=True,
+    )
+
+    # The ETP must NOT be locked by the resolver. The user's message
+    # asserted ``BTC-USDT`` (the canonical spelling of BTCUSDT), so the
+    # user-seeded identity IS in authorized_symbols — but the resolver
+    # record is ``conflicting``, which keeps the identity gate from
+    # approving tool calls until the model re-resolves with a crypto
+    # pair spelling.
+    assert ledger.identity_status == "conflicting"
+    # The ETP itself is never locked; the only locked symbol is the one
+    # the user spelled out in the message.
+    assert "VALOUR-BTC-0-SEK.ST" not in ledger.authorized_symbols
+
+
+def test_resolver_locks_crypto_pair_when_quote_matches(tmp_path: Path) -> None:
+    """A single crypto row whose quote matches the asserted pair is locked."""
+    resolver_payload = json.dumps(
+        {
+            "ok": True,
+            "source": "symbol_search",
+            "data": {
+                "query": "BTC-USDT",
+                "count": 1,
+                "candidates": [
+                    {
+                        "symbol": "BTC-USDT",
+                        "name": "Bitcoin Tether",
+                        "market": "crypto",
+                        "type": "CRYPTOCURRENCY",
+                        "exchange": "CCC",
+                        "source": "yahoo",
+                    }
+                ],
+                "sources": {"eastmoney": "ok", "yahoo": "ok"},
+            },
+        },
+        ensure_ascii=False,
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Get BTC-USDT spot price",
+    )
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "BTC-USDT"},
+        result=resolver_payload,
+        call_id="resolve-btcusdt",
+        success=True,
+    )
+
+    assert ledger.identity_status == "locked"
+    assert ledger.authorized_symbols == {"BTC-USDT"}
+
+
+def test_resolver_flags_wrong_stablecoin_quote(tmp_path: Path) -> None:
+    """A ``BTC-USDT`` query is a real conflict if Yahoo returns ``BTC-USD``.
+
+    ``BTC-USD`` (Circle USDC-equivalent) and ``BTC-USDT`` (Tether) are
+    different spot pairs on different venues. Locking one when the user
+    asserted the other would let the gate silently approve a price for
+    the wrong stablecoin. The asserted-symbol check catches this.
+    """
+    resolver_payload = json.dumps(
+        {
+            "ok": True,
+            "source": "symbol_search",
+            "data": {
+                "query": "BTC-USDT",
+                "count": 1,
+                "candidates": [
+                    {
+                        "symbol": "BTC-USD",
+                        "name": "Bitcoin USD",
+                        "market": "crypto",
+                        "type": "CRYPTOCURRENCY",
+                        "exchange": "CCC",
+                        "source": "yahoo",
+                    }
+                ],
+                "sources": {"eastmoney": "ok", "yahoo": "ok"},
+            },
+        },
+        ensure_ascii=False,
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message="Get BTC-USDT spot price",
+    )
+    ledger.ingest_tool_result(
+        tool_name="search_symbol",
+        arguments={"query": "BTC-USDT"},
+        result=resolver_payload,
+        call_id="resolve-btcusdt",
+        success=True,
+    )
+
+    assert ledger.identity_status == "conflicting"
+    assert "BTC-USD" not in ledger.authorized_symbols
 
 
 def test_stale_history_identity_does_not_unlock_new_subject(tmp_path: Path) -> None:
