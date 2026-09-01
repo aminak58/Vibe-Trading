@@ -229,6 +229,16 @@ class ExecutionIdentity(BaseModel):
             }
         )
 
+    def with_status(self, status: ExecutionIdentityStatus) -> "ExecutionIdentity":
+        """Return a new revision for a terminal or resolving state transition."""
+        return type(self).model_validate(
+            {
+                **self.model_dump(mode="python"),
+                "revision": self.revision + 1,
+                "status": status,
+            }
+        )
+
 
 def _canonicalize(value: Any) -> Any:
     """Strip volatile provenance fields before hashing an identity revision."""

@@ -1064,14 +1064,15 @@ class AgentLoop:
             self.memory.run_dir = str(run_dir)
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
+        self._execution_identity = ExecutionIdentityLedger(
+            run_dir=run_dir,
+            user_message=user_message,
+        )
         self._grounding = GroundingLedger(
             run_dir=run_dir,
             user_message=user_message,
             history=history,
-        )
-        self._execution_identity = ExecutionIdentityLedger(
-            run_dir=run_dir,
-            user_message=user_message,
+            execution_identity=self._execution_identity.snapshot(),
         )
 
         context = ContextBuilder(self.registry, self.memory,
@@ -2577,6 +2578,15 @@ class AgentLoop:
 
         if self._execution_identity is not None and tc.name == "read_document":
             self._execution_identity.ingest_document_result(result, call_id=tc.id)
+        elif self._execution_identity is not None and tc.name == "search_symbol":
+            self._execution_identity.ingest_resolver_result(
+                arguments=_normalize_tool_run_dir(tc.arguments, self.memory.run_dir),
+                result=result,
+                call_id=tc.id,
+                success=success,
+            )
+            if self._grounding is not None:
+                self._grounding.set_execution_identity(self._execution_identity.snapshot())
 
         # Cache successful deterministic results so an identical later call is
         # served without re-execution (regression: repeated financial_rigor

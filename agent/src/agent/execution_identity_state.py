@@ -15,6 +15,7 @@ from src.execution_identity import (
     ExecutionMode,
     ExecutionPolicy,
     ExecutionRequest,
+    ExecutionResolution,
     FallbackPolicy,
     IdentityProvenance,
     ProvenanceAuthority,
@@ -87,6 +88,71 @@ class ExecutionIdentityLedger:
             platform=platform,
             provenance=provenance,
         )
+        self.persist()
+
+    def ingest_resolver_result(
+        self,
+        *,
+        arguments: Mapping[str, Any],
+        result: str,
+        call_id: str,
+        success: bool,
+    ) -> None:
+        """Append only a source-native resolution to a strict identity."""
+        if self._identity.mode is not ExecutionMode.SOURCE_SCOPED:
+            return
+        if not success:
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+            self.persist()
+            return
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+            self.persist()
+            return
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        candidates = data.get("candidates") if isinstance(data, Mapping) else None
+        if not isinstance(candidates, list) or len(candidates) != 1 or not self._identity.requests:
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+            self.persist()
+            return
+        candidate = candidates[0] if isinstance(candidates[0], Mapping) else {}
+        request = self._identity.requests[0]
+        source = str(candidate.get("source") or arguments.get("source") or "").casefold() or None
+        requested = str(candidate.get("requested_symbol") or candidate.get("symbol") or "").upper() or None
+        if request.source and source != request.source.casefold():
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+            self.persist()
+            return
+        if request.symbol and requested != request.symbol.upper():
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+            self.persist()
+            return
+        try:
+            self._identity = self._identity.with_resolution(
+                ExecutionResolution(
+                    request_id=request.request_id,
+                    canonical_asset=str(candidate.get("name") or "") or None,
+                    resolved_symbol=str(candidate.get("resolved_symbol") or "").upper() or None,
+                    source=source,
+                    broker=str(candidate.get("source_namespace") or "") or None,
+                    venue=str(candidate.get("exchange") or "") or None,
+                    asset_class=str(candidate.get("type") or "") or None,
+                    market=str(candidate.get("market_type") or candidate.get("market") or "") or None,
+                    resolver_evidence_ref=f"tool:search_symbol:{call_id}",
+                    provenance=(
+                        IdentityProvenance(
+                            authority=ProvenanceAuthority.SOURCE_RESOLVER,
+                            origin="search_symbol",
+                            evidence_ref=f"tool:search_symbol:{call_id}",
+                            confidence=1.0,
+                        ),
+                    ),
+                )
+            )
+        except ValueError:
+            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
         self.persist()
 
     def persist(self) -> None:

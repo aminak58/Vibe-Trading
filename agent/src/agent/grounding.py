@@ -31,10 +31,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from src.execution_identity import ExecutionIdentity, ExecutionIdentityStatus, ExecutionMode, SourceMode
+
 
 GROUNDING_ARTIFACT = "grounding_evidence.json"
 
 _RESOLVER_TOOL = "search_symbol"
+_EXPLICIT_SOURCE_RE = re.compile(r"\bsource\s*(?:=|:)\s*['\"]?([a-z0-9_-]+)", re.IGNORECASE)
 _PRIVATE_COMPANY_SKILL_NAMES = {
     "private-company",
     "private-company-analysis",
@@ -863,6 +866,13 @@ class IdentityRecord:
     source_tool_call_id: str | None = None
     source: list[str] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
+    # Generic/public resolution retains the historical ``symbol`` contract.
+    # Source-scoped broker resolution additionally records both the caller's
+    # logical symbol and the provider-native alias without conflating venues.
+    requested_symbol: str | None = None
+    resolved_symbol: str | None = None
+    market_type: str | None = None
+    source_namespace: str | None = None
     version: int = 1
     updated_at: str = field(default_factory=_utc_now)
 
@@ -932,6 +942,7 @@ class GroundingLedger:
         run_dir: Path,
         user_message: str,
         history: Sequence[Mapping[str, Any]] | None = None,
+        execution_identity: ExecutionIdentity | None = None,
     ) -> None:
         """Create a ledger and seed only authoritative prior identities.
 
@@ -954,6 +965,9 @@ class GroundingLedger:
         self._price_evidence_attempts = 0
         self._ingested_csvs: set[str] = set()
         self._identity_required = bool(_ACTIONABLE_MARKET_RE.search(user_message))
+        source_match = _EXPLICIT_SOURCE_RE.search(user_message or "")
+        self._explicit_source = source_match.group(1).casefold() if source_match else None
+        self._execution_identity = execution_identity
         self._buffer_output = self._identity_required
         # Every instrument this run is entitled to write about: the ones the
         # user named, plus the ones a succeeding tool call passed in or returned.
@@ -964,6 +978,11 @@ class GroundingLedger:
         self._session_symbol_roots: set[str] = set()
 
         self._seed_symbols(user_message, source="user_message")
+        self.persist()
+
+    def set_execution_identity(self, execution_identity: ExecutionIdentity) -> None:
+        """Replace only the server-owned identity snapshot for later batches."""
+        self._execution_identity = execution_identity
         self.persist()
 
     @property
@@ -1018,6 +1037,7 @@ class GroundingLedger:
         """Return compact identity state for traces and tool errors."""
         return {
             "status": self.identity_status,
+            "requested_source": self._explicit_source,
             "authorized_symbols": sorted(self.authorized_symbols),
             "records": [asdict(record) for record in self._identities.values()],
             "recovery": self.recovery_summary(),
@@ -1059,7 +1079,22 @@ class GroundingLedger:
             An allow/block decision. Resolver calls are allowed but their result
             cannot affect another call in this same batch.
         """
+        identity_authorization = self._authorize_execution_identity(tool_name, arguments)
+        if identity_authorization is not None:
+            return identity_authorization
+
         if tool_name == _RESOLVER_TOOL:
+            resolver_source = str(arguments.get("source") or "").strip().casefold()
+            if self._explicit_source == "mt5" and resolver_source != "mt5":
+                return ToolAuthorization(
+                    allowed=False,
+                    error_code="identity_source_required",
+                    message=(
+                        "The user explicitly requested source='mt5'. Resolve this symbol "
+                        "against the connected MT5 broker namespace with "
+                        "search_symbol(..., source='mt5'), not public providers."
+                    ),
+                )
             self._identity_required = True
             self._buffer_output = True
             self._begin_resolution(str(arguments.get("query") or ""), call_id)
@@ -1085,6 +1120,46 @@ class GroundingLedger:
         symbols = tuple(self._extract_symbol_arguments(arguments))
         if not symbols:
             return ToolAuthorization(allowed=True)
+
+        requested_source = str(arguments.get("source") or "").strip().casefold()
+        mt5_locks = [
+            record
+            for record in self._identities.values()
+            if record.status == "locked" and "mt5" in {item.casefold() for item in record.source}
+        ]
+        matching_mt5_locks = [
+            record
+            for record in mt5_locks
+            if all(self._matches_source_scoped_identity(symbol, record) for symbol in symbols)
+        ]
+        if requested_source == "mt5":
+            if not matching_mt5_locks:
+                return ToolAuthorization(
+                    allowed=False,
+                    error_code="identity_source_required",
+                    message=(
+                        "Explicit MT5 market data requires a locked identity from the "
+                        "connected MT5 broker namespace; call search_symbol with source='mt5' "
+                        "in a separate assistant turn first."
+                    ),
+                    symbols=symbols,
+                )
+            return ToolAuthorization(allowed=True, symbols=symbols)
+
+        if matching_mt5_locks and (
+            tool_name.startswith("trading_")
+            or tool_name == "get_market_data"
+        ):
+            return ToolAuthorization(
+                allowed=False,
+                error_code="identity_source_mismatch",
+                message=(
+                    "This instrument was locked against the connected MT5 broker namespace. "
+                    "It cannot authorize a public or selected-trading-connector request; "
+                    "request source='mt5' or resolve the intended source separately."
+                ),
+                symbols=symbols,
+            )
 
         self._identity_required = True
         self._buffer_output = True
@@ -1130,6 +1205,90 @@ class GroundingLedger:
                 symbols=mismatched,
             )
         return ToolAuthorization(allowed=True, symbols=symbols)
+
+    def _authorize_execution_identity(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+    ) -> ToolAuthorization | None:
+        """Apply strict server-owned identity rules before legacy grounding."""
+        identity = self._execution_identity
+        if (
+            identity is None
+            or identity.mode is not ExecutionMode.SOURCE_SCOPED
+            or identity.policy.source_mode is not SourceMode.STRICT
+        ):
+            return None
+        if not identity.requests:
+            return ToolAuthorization(
+                allowed=False,
+                error_code="denied_by_execution_identity",
+                message="Strict execution identity has no requested instrument.",
+            )
+        request = identity.requests[0]
+        requested_source = str(arguments.get("source") or "").strip().casefold()
+        if tool_name == _RESOLVER_TOOL:
+            if requested_source != (request.source or "").casefold():
+                return ToolAuthorization(
+                    allowed=False,
+                    error_code="denied_by_execution_identity",
+                    message="Strict identity requires source-native symbol resolution.",
+                )
+            query = str(arguments.get("query") or "").strip().upper()
+            if request.symbol and query != request.symbol.upper():
+                return ToolAuthorization(
+                    allowed=False,
+                    error_code="denied_by_execution_identity",
+                    message="Resolver query differs from the authoritative requested symbol.",
+                )
+            return None
+        symbols = tuple(self._extract_symbol_arguments(arguments))
+        if not symbols:
+            return None
+        if identity.status is not ExecutionIdentityStatus.VERIFIED:
+            return ToolAuthorization(
+                allowed=False,
+                error_code="identity_resolution_required",
+                message="Strict execution requires a verified source-native identity before data use.",
+                symbols=symbols,
+            )
+        allowed_symbols = {
+            value.upper()
+            for value in (
+                request.symbol,
+                *(resolution.resolved_symbol for resolution in identity.resolutions),
+            )
+            if value
+        }
+        if request.source and requested_source != request.source.casefold():
+            return ToolAuthorization(
+                allowed=False,
+                error_code="denied_by_execution_identity",
+                message="Requested data source differs from the authoritative strict source.",
+                symbols=symbols,
+            )
+        if any(str(symbol).upper() not in allowed_symbols for symbol in symbols):
+            return ToolAuthorization(
+                allowed=False,
+                error_code="denied_by_execution_identity",
+                message="Requested symbol differs from the verified source-scoped identity.",
+                symbols=symbols,
+            )
+        # The strict snapshot is authoritative. Returning an explicit allow
+        # prevents legacy per-tool locks from re-evaluating and blocking an
+        # already verified requested/provider-native alias pair.
+        return ToolAuthorization(allowed=True, symbols=symbols)
+
+    @staticmethod
+    def _matches_source_scoped_identity(symbol: str, record: IdentityRecord) -> bool:
+        """Match a caller symbol to either logical or provider-native MT5 name."""
+        requested = _normalize_symbol(symbol)
+        aliases = {
+            _normalize_symbol(value)
+            for value in (record.symbol, record.requested_symbol, record.resolved_symbol)
+            if value
+        }
+        return requested in aliases
 
     @staticmethod
     def _venue_mismatch_hints(
@@ -1672,6 +1831,22 @@ class GroundingLedger:
             source_tool_call_id=call_id,
             source=source_names,
             candidates=candidates,
+            requested_symbol=(
+                _normalize_symbol(chosen.get("requested_symbol"))
+                if chosen.get("requested_symbol")
+                else None
+            ),
+            resolved_symbol=(
+                _normalize_symbol(chosen.get("resolved_symbol"))
+                if chosen.get("resolved_symbol")
+                else None
+            ),
+            market_type=(
+                str(chosen.get("market_type") or chosen.get("market") or "").strip() or None
+            ),
+            source_namespace=(
+                str(chosen.get("source_namespace") or "").strip() or None
+            ),
             version=version,
         )
         self._supersede_shortlists(symbol)
