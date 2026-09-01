@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.context import ContextBuilder
 from src.agent.grounding import GroundingLedger
+from src.agent.execution_identity_state import ExecutionIdentityLedger
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
@@ -943,6 +944,7 @@ class AgentLoop:
         self._run_iteration: int = 0
         self._has_run = False
         self._grounding: GroundingLedger | None = None
+        self._execution_identity: ExecutionIdentityLedger | None = None
         self._released_fallback = False
         self._released_fallback_reason: str | None = None
         self._written_files: set[str] = set()
@@ -1066,6 +1068,10 @@ class AgentLoop:
             run_dir=run_dir,
             user_message=user_message,
             history=history,
+        )
+        self._execution_identity = ExecutionIdentityLedger(
+            run_dir=run_dir,
+            user_message=user_message,
         )
 
         context = ContextBuilder(self.registry, self.memory,
@@ -2568,6 +2574,9 @@ class AgentLoop:
                         "identity": self._grounding.identity_summary(),
                     }
                 )
+
+        if self._execution_identity is not None and tc.name == "read_document":
+            self._execution_identity.ingest_document_result(result, call_id=tc.id)
 
         # Cache successful deterministic results so an identical later call is
         # served without re-execution (regression: repeated financial_rigor

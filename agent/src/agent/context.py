@@ -334,7 +334,8 @@ class ContextBuilder:
                     lines = [f"- **{r.title}** ({r.memory_type}): {r.body[:500]}" for r in recalls]
                     recall_block = "\n".join(lines)
                     enriched = (
-                        f"<recalled-memories>\n{recall_block}\n</recalled-memories>\n\n"
+                        "<historical-memory advisory=\"true\" authority=\"non-execution\">\n"
+                        f"{recall_block}\n</historical-memory>\n\n"
                         f"{user_message}"
                     )
             except Exception as exc:
