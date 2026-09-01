@@ -612,7 +612,12 @@ def _snippet(prompt: str, max_len: int = 240) -> str:
     return s if len(s) <= max_len else s[: max_len - 3] + "..."
 
 
-def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
+def _build_variables(
+    preset_name: str,
+    prompt: str,
+    *,
+    execution_identity: Any | None = None,
+) -> dict[str, str]:
     """Build template variables from prompt for the matched preset.
 
     Args:
@@ -623,6 +628,11 @@ def _build_variables(preset_name: str, prompt: str) -> dict[str, str]:
         Dict of template variables required by the YAML preset.
     """
     market = _extract_market(prompt)
+    if execution_identity is not None:
+        resolutions = getattr(execution_identity, "resolutions", ())
+        resolved_market = next((item.market for item in resolutions if getattr(item, "market", None)), None)
+        if resolved_market:
+            market = str(resolved_market)
     risk = _extract_risk_tolerance(prompt)
     goal = prompt.strip()
     g = _snippet(goal, 2000)
@@ -731,6 +741,8 @@ class SwarmTool(BaseTool):
             JSON string with status, preset, variables, final_report, tasks, token_usage.
         """
         prompt = kwargs.get("prompt", "")
+        execution_identity = kwargs.get("__execution_identity")
+        owner_session_id = kwargs.get("__owner_session_id")
 
         if not prompt:
             return json.dumps(
@@ -745,7 +757,7 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
         assert preset is not None
-        variables = _build_variables(preset, prompt)
+        variables = _build_variables(preset, prompt, execution_identity=execution_identity)
 
         logger.info(
             "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",
@@ -793,6 +805,8 @@ class SwarmTool(BaseTool):
                 variables,
                 live_callback=_live_callback if self._event_callback is not None else None,
                 include_shell_tools=self.include_shell_tools,
+                execution_identity=execution_identity,
+                owner_session_id=owner_session_id,
             )
         except FileNotFoundError as exc:
             return json.dumps(

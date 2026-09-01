@@ -2,6 +2,13 @@ name: quant_strategy_desk
 title: "Quant Strategy Desk"
 description: "Stock screening + factor research in parallel → strategy backtest → risk audit → final report."
 
+capabilities:
+  asset_classes: [equity]
+  sources: [auto]
+  source_scoped_execution: false
+  synthetic_data: explicit_only
+  multi_symbol: true
+
 agents:
   - id: screener
     role: Stock Screener

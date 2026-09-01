@@ -2273,6 +2273,11 @@ class AgentLoop:
             Tuple of (result_str, elapsed_ms).
         """
         readonly = self._is_tool_readonly(tool_name)
+        invocation_args = dict(args)
+        if tool_name == "run_swarm" and self._execution_identity is not None:
+            # This value is deliberately not part of the model-facing tool
+            # schema. The server owns the current identity snapshot.
+            invocation_args["__execution_identity"] = self._execution_identity.snapshot()
         timed_out = threading.Event()
 
         def _on_progress(event: ProgressEvent) -> None:
@@ -2363,7 +2368,7 @@ class AgentLoop:
             _set_emitter(_on_progress)
             try:
                 with _heartbeat_timer():
-                    result = self.registry.execute(tool_name, args)
+                    result = self.registry.execute(tool_name, invocation_args)
             finally:
                 finished.set()
                 _set_emitter(None)
@@ -2377,7 +2382,7 @@ class AgentLoop:
         def _worker() -> None:
             _set_emitter(_on_progress)
             try:
-                result_queue.put((self.registry.execute(tool_name, args), None))
+                result_queue.put((self.registry.execute(tool_name, invocation_args), None))
             except BaseException as exc:  # noqa: BLE001 - propagate through caller thread
                 result_queue.put((None, exc))
             finally:

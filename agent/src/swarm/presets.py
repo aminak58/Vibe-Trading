@@ -24,7 +24,8 @@ from string import Formatter
 
 import yaml
 
-from src.swarm.models import RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, TaskStatus
+from src.execution_identity import ExecutionIdentity, ExecutionMode, SourceMode
+from src.swarm.models import PresetCapabilities, RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, TaskStatus
 from src.swarm.task_store import topological_layers, validate_dag
 
 PRESETS_DIR = Path(__file__).resolve().parent / "presets"
@@ -106,6 +107,36 @@ def load_preset(name: str) -> dict:
             f"the bundled presets. Available: {available}"
         )
     return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def preset_capabilities(name: str) -> PresetCapabilities | None:
+    """Return explicit preset capabilities, or ``None`` for legacy YAML."""
+    raw = load_preset(name).get("capabilities")
+    return PresetCapabilities.model_validate(raw) if isinstance(raw, dict) else None
+
+
+def validate_preset_identity(name: str, identity: ExecutionIdentity | None) -> PresetCapabilities | None:
+    """Reject strict execution when a preset cannot declare compatibility."""
+    capabilities = preset_capabilities(name)
+    if (
+        identity is None
+        or identity.mode is not ExecutionMode.SOURCE_SCOPED
+        or identity.policy.source_mode is not SourceMode.STRICT
+    ):
+        return capabilities
+    if capabilities is None or not capabilities.source_scoped_execution:
+        raise ValueError(f"Preset '{name}' is not declared compatible with strict source-scoped execution")
+    requested_sources = {request.source.casefold() for request in identity.requests if request.source}
+    supported_sources = {source.casefold() for source in capabilities.sources}
+    if requested_sources and not requested_sources.issubset(supported_sources):
+        raise ValueError(f"Preset '{name}' does not support required source(s): {sorted(requested_sources)}")
+    resolved_classes = {resolution.asset_class.casefold() for resolution in identity.resolutions if resolution.asset_class}
+    supported_classes = {item.casefold() for item in capabilities.asset_classes}
+    if resolved_classes and supported_classes and not resolved_classes.issubset(supported_classes):
+        raise ValueError(f"Preset '{name}' does not support resolved asset class(es): {sorted(resolved_classes)}")
+    if len(identity.requests) > 1 and not capabilities.multi_symbol:
+        raise ValueError(f"Preset '{name}' does not support multi-symbol strict execution")
+    return capabilities
 
 
 def list_presets() -> list[dict]:
@@ -283,7 +314,13 @@ def inspect_preset(name: str) -> dict:
     }
 
 
-def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmRun:
+def build_run_from_preset(
+    preset_name: str,
+    user_vars: dict[str, str],
+    *,
+    execution_identity: ExecutionIdentity | None = None,
+    owner_session_id: str | None = None,
+) -> SwarmRun:
     """Create a SwarmRun from a preset with user variables applied.
 
     Steps:
@@ -305,6 +342,7 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
         ValueError: If preset YAML is malformed.
     """
     data = load_preset(preset_name)
+    capabilities = validate_preset_identity(preset_name, execution_identity)
 
     # Parse agents
     agents: list[SwarmAgentSpec] = []
@@ -350,4 +388,9 @@ def build_run_from_preset(preset_name: str, user_vars: dict[str, str]) -> SwarmR
         agents=agents,
         tasks=tasks,
         created_at=now.isoformat(),
+        execution_identity=execution_identity,
+        identity_hash=execution_identity.identity_hash if execution_identity is not None else None,
+        owner_session_id=owner_session_id,
+        provenance_validation_status=("pending" if execution_identity is not None else "not_required"),
+        preset_capabilities=capabilities,
     )

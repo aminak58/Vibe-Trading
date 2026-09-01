@@ -1225,6 +1225,14 @@ class GroundingLedger:
                 error_code="denied_by_execution_identity",
                 message="Strict execution identity has no requested instrument.",
             )
+        if tool_name == "run_swarm":
+            if identity.status is not ExecutionIdentityStatus.VERIFIED:
+                return ToolAuthorization(
+                    allowed=False,
+                    error_code="identity_resolution_required",
+                    message="Strict source-scoped Swarm execution requires a verified identity.",
+                )
+            return ToolAuthorization(allowed=True)
         request = identity.requests[0]
         requested_source = str(arguments.get("source") or "").strip().casefold()
         if tool_name == _RESOLVER_TOOL:

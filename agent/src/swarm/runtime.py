@@ -40,6 +40,7 @@ from src.swarm.models import (
     public_reasoning_effort,
 )
 from src.swarm.presets import build_run_from_preset
+from src.execution_identity import ExecutionIdentity
 from src.swarm.store import SwarmStore
 from src.swarm.task_store import (
     TaskStore,
@@ -292,6 +293,8 @@ class SwarmRuntime:
         live_callback: Callable | None = None,
         include_shell_tools: bool = False,
         resume_from: SwarmRun | None = None,
+        execution_identity: ExecutionIdentity | None = None,
+        owner_session_id: str | None = None,
     ) -> SwarmRun:
         """Start a swarm run. Returns immediately, execution happens in background.
 
@@ -324,7 +327,12 @@ class SwarmRuntime:
         except Exception:
             logger.warning("Stale-run reaper failed", exc_info=True)
 
-        run = build_run_from_preset(preset_name, user_vars)
+        run = build_run_from_preset(
+            preset_name,
+            user_vars,
+            execution_identity=execution_identity,
+            owner_session_id=owner_session_id,
+        )
         validate_dag(run.tasks)
 
         # Capture which provider/model the run was launched against so the

@@ -11,6 +11,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field
 
+from src.execution_identity import ExecutionIdentity
 from src.tools.redaction import redact_text
 
 
@@ -171,6 +172,16 @@ class WorkerStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class PresetCapabilities(BaseModel):
+    """Minimal declarative eligibility contract for source-scoped Swarms."""
+
+    asset_classes: list[str] = Field(default_factory=list)
+    sources: list[str] = Field(default_factory=list)
+    source_scoped_execution: bool = False
+    synthetic_data: str = "explicit_only"
+    multi_symbol: bool = False
+
+
 class SwarmAgentSpec(BaseModel):
     """Role definition for a single agent in a Swarm.
 
@@ -307,6 +318,11 @@ class SwarmRun(BaseModel):
     reasoning_effort: str | None = None
     use_responses_api: bool | None = None
     grounding_data: dict[str, list[dict]] | None = None
+    execution_identity: ExecutionIdentity | None = None
+    identity_hash: str | None = None
+    owner_session_id: str | None = None
+    provenance_validation_status: str = "not_required"
+    preset_capabilities: PresetCapabilities | None = None
 
 
 class WorkerResult(BaseModel):
