@@ -757,7 +757,11 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
         assert preset is not None
-        variables = _build_variables(preset, prompt, execution_identity=execution_identity)
+        variables = (
+            _build_variables(preset, prompt, execution_identity=execution_identity)
+            if execution_identity is not None
+            else _build_variables(preset, prompt)
+        )
 
         logger.info(
             "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",
@@ -800,14 +804,14 @@ class SwarmTool(BaseTool):
                     {"run_id": current_run_id, "event": payload},
                 )
 
-            run = runtime.start_run(
-                preset,
-                variables,
-                live_callback=_live_callback if self._event_callback is not None else None,
-                include_shell_tools=self.include_shell_tools,
-                execution_identity=execution_identity,
-                owner_session_id=owner_session_id,
-            )
+            start_kwargs = {
+                "live_callback": _live_callback if self._event_callback is not None else None,
+                "include_shell_tools": self.include_shell_tools,
+            }
+            if execution_identity is not None:
+                start_kwargs["execution_identity"] = execution_identity
+                start_kwargs["owner_session_id"] = owner_session_id
+            run = runtime.start_run(preset, variables, **start_kwargs)
         except FileNotFoundError as exc:
             return json.dumps(
                 {"status": "error", "error": f"Preset not found: {exc}"},

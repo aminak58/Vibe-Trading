@@ -958,6 +958,8 @@ class AgentLoop:
         # 5-9x each (2026-08-20 INTC run) because it could no longer see its
         # own verification records.
         self._called_identical: dict[tuple[str, str], str] = {}
+        self._active_swarm_run_id: str | None = None
+        self._active_swarm_identity_hash: str | None = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1025,6 +1027,81 @@ class AgentLoop:
         except Exception as exc:  # noqa: BLE001
             logger.warning("run manifest not written (%s: %s)", type(exc).__name__, exc)
 
+    def _swarm_ownership_path(self) -> Path | None:
+        return Path(self.memory.run_dir) / "swarm_ownership.json" if self.memory.run_dir else None
+
+    def _restore_swarm_ownership(self, run_dir: Path) -> None:
+        path = run_dir / "swarm_ownership.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if payload.get("status") == "running":
+            self._active_swarm_run_id = str(payload.get("run_id") or "") or None
+            self._active_swarm_identity_hash = str(payload.get("identity_hash") or "") or None
+
+    def _persist_swarm_ownership(self, status: str) -> None:
+        path = self._swarm_ownership_path()
+        if path is None:
+            return
+        payload = {
+            "status": status,
+            "run_id": self._active_swarm_run_id,
+            "identity_hash": self._active_swarm_identity_hash,
+        }
+        try:
+            path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            logger.warning("could not persist swarm ownership", exc_info=True)
+
+    def _record_swarm_ownership(self, result: str) -> None:
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict) or not payload.get("wait_budget_exhausted"):
+            return
+        if str(payload.get("status") or "") not in {"pending", "running"}:
+            return
+        self._active_swarm_run_id = str(payload.get("run_id") or "") or None
+        self._active_swarm_identity_hash = (
+            self._execution_identity.snapshot().identity_hash
+            if self._execution_identity is not None
+            else None
+        )
+        self._persist_swarm_ownership("running")
+
+    def _clear_completed_swarm_ownership(self, result: str) -> None:
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict) or payload.get("run_id") != self._active_swarm_run_id:
+            return
+        if str(payload.get("status") or "") in {"completed", "failed", "cancelled"}:
+            self._persist_swarm_ownership("terminal")
+            self._active_swarm_run_id = None
+            self._active_swarm_identity_hash = None
+
+    def _swarm_ownership_block(self, tool_name: str) -> str | None:
+        if self._active_swarm_run_id is None:
+            return None
+        if tool_name not in {"run_swarm", "backtest", "get_market_data"}:
+            return None
+        return json.dumps(
+            {
+                "status": "error",
+                "error_code": "swarm_ownership_active",
+                "message": (
+                    "A Swarm run is still active after its wait budget elapsed. "
+                    "Poll, wait for, or cancel that same run; do not start replacement research."
+                ),
+                "run_id": self._active_swarm_run_id,
+                "identity_hash": self._active_swarm_identity_hash,
+            },
+            ensure_ascii=False,
+        )
+
     def run(self, user_message: str, history: Optional[List[Dict[str, Any]]] = None, session_id: str = "") -> Dict[str, Any]:
         """Run the ReAct loop synchronously.
 
@@ -1052,6 +1129,8 @@ class AgentLoop:
         self._last_activity_wall = _time.time()
         self._run_done = threading.Event()
         self._called_identical = {}
+        self._active_swarm_run_id = None
+        self._active_swarm_identity_hash = None
         run_started_wall = _time.time()
 
         state_store = RunStateStore()
@@ -1062,6 +1141,8 @@ class AgentLoop:
         else:
             run_dir = state_store.create_run_dir(RUNS_DIR)
             self.memory.run_dir = str(run_dir)
+
+        self._restore_swarm_ownership(run_dir)
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
         self._execution_identity = ExecutionIdentityLedger(
@@ -1945,6 +2026,11 @@ class AgentLoop:
                 react_trace.append({"type": "tool_skipped", "tool": tc.name})
                 continue
 
+            ownership_block = self._swarm_ownership_block(tc.name)
+            if ownership_block is not None:
+                execution_plan.append((tc, ownership_block))
+                continue
+
             if self._grounding is not None:
                 authorization = self._grounding.authorize_tool_call(
                     tc.name,
@@ -2592,6 +2678,11 @@ class AgentLoop:
             )
             if self._grounding is not None:
                 self._grounding.set_execution_identity(self._execution_identity.snapshot())
+
+        if tc.name == "run_swarm":
+            self._record_swarm_ownership(result)
+        elif tc.name == "get_swarm_status":
+            self._clear_completed_swarm_ownership(result)
 
         # Cache successful deterministic results so an identical later call is
         # served without re-execution (regression: repeated financial_rigor
