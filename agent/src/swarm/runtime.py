@@ -820,6 +820,13 @@ class SwarmRuntime:
 
     def _prefetch_grounding_data(self, run: SwarmRun) -> None:
         """Fetch run-level grounding data without blocking ``start_run``."""
+        if (
+            run.execution_identity is not None
+            and run.execution_identity.policy.source_mode.value == "strict"
+        ):
+            # Strict source-scoped work must consume its verified source path,
+            # never infer symbols/providers from free-form user_vars.
+            return
         symbols = grounding.extract_symbols_from_user_vars(run.user_vars)
         if not symbols:
             return
@@ -1003,6 +1010,7 @@ class SwarmRuntime:
                     include_shell_tools=include_shell_tools,
                     grounding_block=grounding_block,
                     cancel_event=cancel_event,
+                    execution_identity=run.execution_identity,
                 )
                 futures[future] = tid
                 per_task_budget = (
@@ -1065,6 +1073,7 @@ class SwarmRuntime:
         include_shell_tools: bool = False,
         grounding_block: str = "",
         cancel_event: threading.Event | None = None,
+        execution_identity: ExecutionIdentity | None = None,
     ) -> WorkerResult:
         """Run a worker with automatic retry on failure.
 
@@ -1150,6 +1159,7 @@ class SwarmRuntime:
                 grounding_block=grounding_block,
                 agent_config=self._agent_config,
                 cancel_event=cancel_event,
+                execution_identity=execution_identity,
             )
 
             cumulative_input_tokens += result.input_tokens

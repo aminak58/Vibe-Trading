@@ -1489,6 +1489,11 @@ def fetch_data_map(config: dict) -> DataFetchResult:
     """
     config = copy.deepcopy(config)
     source = str(config.get("source") or "tushare")
+    raw_policy = config.get("_execution_policy")
+    strict_source = (
+        isinstance(raw_policy, dict)
+        and str(raw_policy.get("source_mode") or "").casefold() == "strict"
+    )
     codes = list(config.get("codes") or [])
     interval = str(config.get("interval") or "1D")
 
@@ -1517,6 +1522,10 @@ def fetch_data_map(config: dict) -> DataFetchResult:
                 source,
                 served_by,
             )
+            if strict_source:
+                raise NoAvailableSourceError(
+                    f"strict source={source} is unavailable; refusing {served_by} substitution"
+                )
         data_map = loader.fetch(
             codes,
             config.get("start_date", ""),
@@ -1534,7 +1543,7 @@ def fetch_data_map(config: dict) -> DataFetchResult:
                 len(codes),
                 missing,
             )
-        if missing:
+        if missing and not strict_source:
             market = _detect_market(codes[0])
             for fallback_source in FALLBACK_CHAINS.get(market, []):
                 if not missing:

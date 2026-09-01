@@ -15,6 +15,8 @@ from src.execution_identity import (
     SourceMode,
 )
 from src.swarm.presets import build_run_from_preset
+from src.swarm.worker import _validate_worker_execution_identity, build_worker_prompt
+from src.swarm.models import SwarmAgentSpec
 from src.tools.swarm_tool import _build_variables
 
 
@@ -66,3 +68,24 @@ def test_verified_identity_market_overrides_incidental_usdt_goal() -> None:
     )
 
     assert variables["market"] == "forex"
+
+
+def test_worker_contract_is_immutable_and_blocks_wrong_source() -> None:
+    identity = _verified_mt5_identity()
+    prompt = build_worker_prompt(
+        SwarmAgentSpec(id="worker", role="role", system_prompt="instructions"),
+        {},
+        "",
+        execution_identity=identity,
+    )
+
+    blocked = _validate_worker_execution_identity(
+        identity,
+        "get_market_data",
+        {"codes": ["XAUT-USDT"], "source": "okx"},
+    )
+
+    assert "Execution Contract (IMMUTABLE)" in prompt
+    assert identity.identity_hash in prompt
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"

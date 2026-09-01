@@ -9,6 +9,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from src.execution_identity import ExecutionPolicy, SourceMode
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROWS = 250
@@ -132,6 +134,7 @@ def fetch_market_data(
     fallback_chain_provider: Callable[[str], list[str]] | None = None,
     max_fallback_attempts: int = 5,
     include_provenance: bool = False,
+    execution_policy: ExecutionPolicy | None = None,
 ) -> dict[str, Any]:
     """Fetch normalized OHLCV data through the repository loader layer.
 
@@ -222,11 +225,22 @@ def fetch_market_data(
             and src not in _NO_NETWORK_FALLBACK_SOURCES
             else None
         )
-        candidates = (
-            list(override)
-            if override is not None and src in override
-            else [src, *chain]
-        )
+        # Explicit MT5 requests are broker-specific research evidence, not a
+        # source preference.  Never substitute a public/local forex provider
+        # when the connected terminal cannot serve the requested instrument.
+        if source == "mt5" or (
+            execution_policy is not None
+            and execution_policy.source_mode is SourceMode.STRICT
+        ):
+            candidates = ["mt5"]
+            if source != "mt5":
+                candidates = [src]
+        else:
+            candidates = (
+                list(override)
+                if override is not None and src in override
+                else [src, *chain]
+            )
         # Deduplicate (preserving order), then cap the attempt budget.
         attempts: list[str] = []
         for candidate in candidates:
@@ -319,7 +333,10 @@ def fetch_market_data(
     # Retry the sibling through the same market chain before giving up, and
     # key the result under the ORIGINAL requested symbol so the grounding/
     # identity gate and callers still see evidence for exactly what was asked.
-    if unresolved:
+    if unresolved and not (
+        execution_policy is not None
+        and execution_policy.source_mode is SourceMode.STRICT
+    ):
         for code in list(unresolved):
             sibling = _ca_venue_sibling(code)
             if sibling is None:
