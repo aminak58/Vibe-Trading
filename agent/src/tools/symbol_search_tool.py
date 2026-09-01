@@ -142,7 +142,9 @@ class SymbolSearchTool(BaseTool):
         "profile; other queries search Eastmoney (China/HK/US names and tickers) and Yahoo "
         "(global) and, for U.S. equities, attaches the SEC CIK. Use this to turn "
         "an ambiguous name into a concrete symbol before calling get_market_data "
-        'or get_sec_filings. Example: search_symbol(query="apple", limit=5).'
+        'or get_sec_filings. For explicit MetaTrader 5 research, pass '
+        'source="mt5" so the connected broker namespace is authoritative. '
+        'Example: search_symbol(query="apple", limit=5).'
     )
     parameters = {
         "type": "object",
@@ -162,6 +164,14 @@ class SymbolSearchTool(BaseTool):
                     f"(1-{_MAX_LIMIT}). Defaults to {_DEFAULT_LIMIT}."
                 ),
                 "default": _DEFAULT_LIMIT,
+            },
+            "source": {
+                "type": "string",
+                "description": (
+                    "Optional authoritative namespace. Use 'mt5' only for an "
+                    "explicit local MetaTrader 5 request; it never falls back "
+                    "to public symbol providers."
+                ),
             },
         },
         "required": ["query"],
@@ -188,6 +198,9 @@ class SymbolSearchTool(BaseTool):
             return _error("'query' is required and must be a non-empty string")
 
         limit = _clamp_limit(kwargs.get("limit", _DEFAULT_LIMIT))
+        source = str(kwargs.get("source") or "").strip().casefold()
+        if source == "mt5":
+            return _search_mt5_broker_symbol(query)
 
         candidates: List[Dict[str, Any]] = []
         sources: Dict[str, str] = {}
@@ -261,6 +274,62 @@ class SymbolSearchTool(BaseTool):
             },
             ensure_ascii=False,
         )
+
+
+def _search_mt5_broker_symbol(query: str) -> str:
+    """Resolve one requested token against the connected MT5 broker only."""
+    try:
+        # Reuse the loader's tested broker-alias algorithm. This lazy import
+        # avoids an agent-tool/backtest import cycle at module load time.
+        from backtest.loaders import mt5_loader
+
+        mt5 = mt5_loader._import_mt5()
+        if mt5 is None or not mt5_loader._ensure_initialized():
+            status = "MT5 terminal is unavailable"
+            candidate: Dict[str, Any] | None = None
+        else:
+            resolved = mt5_loader._resolve_broker_symbol(mt5, query)
+            if not resolved:
+                status = "ok"
+                candidate = None
+            else:
+                info = mt5.symbol_info(resolved)
+                requested = mt5_loader._to_query_base(query)
+                candidate = {
+                    # ``symbol`` remains the logical caller spelling. The
+                    # broker alias is recorded separately for source-scoped
+                    # authorization and provenance.
+                    "symbol": requested,
+                    "requested_symbol": requested,
+                    "resolved_symbol": resolved,
+                    "market": "forex",
+                    "market_type": "forex",
+                    "type": "forex",
+                    "exchange": "MT5",
+                    "source": "mt5",
+                    "source_namespace": "connected_mt5_broker",
+                    "name": str(getattr(info, "description", "") or resolved),
+                }
+                status = "ok"
+    except Exception as exc:  # noqa: BLE001 - keep identity failures structured
+        status = f"MT5 resolution failed: {exc}"
+        candidate = None
+
+    candidates = [candidate] if candidate is not None else []
+    return json.dumps(
+        {
+            "ok": True,
+            "market": "mt5",
+            "source": "symbol_search",
+            "data": {
+                "query": query,
+                "count": len(candidates),
+                "candidates": candidates,
+                "sources": {"mt5": status},
+            },
+        },
+        ensure_ascii=False,
+    )
 
 
 def _clamp_limit(value: Any) -> int:

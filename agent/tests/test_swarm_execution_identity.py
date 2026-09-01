@@ -17,7 +17,7 @@ from src.execution_identity import (
 from src.swarm.presets import build_run_from_preset
 from src.swarm.worker import _validate_worker_execution_identity, build_worker_prompt
 from src.swarm.models import SwarmAgentSpec
-from src.tools.swarm_tool import _build_variables
+from src.tools.swarm_tool import SwarmTool, _build_variables
 
 
 def _verified_mt5_identity() -> ExecutionIdentity:
@@ -89,3 +89,34 @@ def test_worker_contract_is_immutable_and_blocks_wrong_source() -> None:
     assert identity.identity_hash in prompt
     assert blocked is not None
     assert blocked["error_code"] == "identity_blocked"
+
+
+def test_incident_context_cannot_mutate_verified_mt5_identity() -> None:
+    """Historical XAUT/USDT prose is non-authoritative once identity is verified."""
+    identity = _verified_mt5_identity()
+    incident_prompt = (
+        "Run the attached XAUUSD MetaTrader/MQL5 research request. "
+        "Historical memory discussed XAUT-USDT on OKX and yfinance."
+    )
+
+    variables = _build_variables("quant_scalp_desk", incident_prompt, execution_identity=identity)
+    run = build_run_from_preset("quant_scalp_desk", variables, execution_identity=identity)
+    blocked = _validate_worker_execution_identity(
+        identity,
+        "get_market_data",
+        {"codes": ["XAUT-USDT"], "source": "okx"},
+    )
+
+    assert variables["market"] == "forex"
+    assert run.identity_hash == identity.identity_hash
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"
+
+
+def test_public_swarm_schema_cannot_issue_authoritative_identity() -> None:
+    assert set(SwarmTool.parameters["properties"]) == {"prompt", "preset_name"}
+    response = SwarmTool().execute(
+        prompt="XAUUSD source=mt5",
+        preset_name="quant_scalp_desk",
+    )
+    assert "trusted server-side execution identity" in response

@@ -115,12 +115,29 @@ def preset_capabilities(name: str) -> PresetCapabilities | None:
     return PresetCapabilities.model_validate(raw) if isinstance(raw, dict) else None
 
 
-def validate_preset_identity(name: str, identity: ExecutionIdentity | None) -> PresetCapabilities | None:
-    """Reject strict execution when a preset cannot declare compatibility."""
+def validate_preset_identity(
+    name: str,
+    identity: ExecutionIdentity | None,
+    *,
+    allow_source_scoped_without_identity: bool = True,
+) -> PresetCapabilities | None:
+    """Reject execution when the preset cannot prove identity compatibility.
+
+    Public/MCP callers deliberately pass ``False`` for
+    ``allow_source_scoped_without_identity``.  They have no trusted
+    AgentLoop-issued identity and therefore cannot start a source-scoped
+    preset merely by supplying free-form variables.
+    """
     capabilities = preset_capabilities(name)
+    if identity is None:
+        if capabilities is not None and capabilities.source_scoped_execution and not allow_source_scoped_without_identity:
+            raise ValueError(
+                f"Preset '{name}' requires a trusted server-side execution identity; "
+                "public GENERIC/AUTO calls cannot start source-scoped execution"
+            )
+        return capabilities
     if (
-        identity is None
-        or identity.mode is not ExecutionMode.SOURCE_SCOPED
+        identity.mode is not ExecutionMode.SOURCE_SCOPED
         or identity.policy.source_mode is not SourceMode.STRICT
     ):
         return capabilities

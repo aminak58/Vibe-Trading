@@ -757,6 +757,26 @@ class SwarmTool(BaseTool):
                 ensure_ascii=False,
             )
         assert preset is not None
+        # This tool may be invoked outside AgentLoop in tests or embedders.
+        # Such a caller has no signed, server-issued strict identity, so it
+        # can run only GENERIC/AUTO presets.  The model-facing schema remains
+        # deliberately unable to supply an identity or policy override.
+        if execution_identity is None:
+            from src.swarm.presets import validate_preset_identity
+
+            try:
+                validate_preset_identity(
+                    preset,
+                    None,
+                    allow_source_scoped_without_identity=False,
+                )
+            except FileNotFoundError:
+                # Compatibility for embedders that replace the runtime/preset
+                # layer with a test or host-provided implementation.  Real
+                # tool routing already resolves a real preset above.
+                pass
+            except ValueError as exc:
+                return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
         variables = (
             _build_variables(preset, prompt, execution_identity=execution_identity)
             if execution_identity is not None

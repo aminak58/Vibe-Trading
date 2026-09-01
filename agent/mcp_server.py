@@ -1652,6 +1652,23 @@ async def run_swarm(
     from src.config import load_swarm_agent_config
     from src.swarm.runtime import SwarmRuntime
     from src.swarm.store import SwarmStore, swarm_runs_root
+    from src.swarm.presets import validate_preset_identity
+
+    # MCP callers can provide variables, not a trusted AgentLoop execution
+    # identity.  Keep this external boundary GENERIC/AUTO-only rather than
+    # accepting model/client asserted source, broker, or fallback authority.
+    try:
+        validate_preset_identity(
+            preset_name,
+            None,
+            allow_source_scoped_without_identity=False,
+        )
+    except FileNotFoundError:
+        # Let the existing runtime return its normal unknown-preset result.
+        # This also preserves host test doubles that own preset resolution.
+        pass
+    except ValueError as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
 
     swarm_dir = swarm_runs_root()
     store = SwarmStore(base_dir=swarm_dir)
