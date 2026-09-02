@@ -53,3 +53,16 @@ def test_mutated_registered_artifact_blocks_before_dispatch(tmp_path, monkeypatc
     runtime._execute_layer(run=run,task_store=TaskStore(store.run_dir("r")/"tasks"),agent_map={a.id:a for a in run.agents},layer_task_ids=["task-risk"],task_summaries={},run_dir=store.run_dir("r"),cancel_event=threading.Event(),include_shell_tools=False,grounding_block="")
     assert calls == []
     assert TaskStore(store.run_dir("r")/"tasks").load_task("task-risk").status is TaskStatus.blocked
+
+
+def test_report_rejects_risk_lineage_from_wrong_run_or_fabricated_id(tmp_path, monkeypatch):
+    refs=[_ref("r",t) for t in _TYPES]; store,runtime,run=_run(tmp_path, refs); rd=store.run_dir("r")
+    bad=ArtifactRef(artifact_id="risk",producer_run_id="prior-retry",producer_task_id="task-risk",producer_agent_id="risk",run_relative_path="artifacts/risk/report.md",sha256=hashlib.sha256(b"x").hexdigest(),byte_size=1,execution_identity_hash="ih",artifact_type="risk.audit_report",provenance_status="passed",derived_from_artifact_ids=[refs[0].artifact_id])
+    p=rd/bad.run_relative_path; p.parent.mkdir(parents=True,exist_ok=True); p.write_text("x")
+    risk=SwarmTask(id="task-risk",agent_id="risk",prompt_template="x",status=TaskStatus.completed,artifact_refs=[bad])
+    report=SwarmTask(id="task-report",agent_id="risk",prompt_template="x",depends_on=["task-backtest","task-risk"],blocked_by=[],input_from={"b":"task-backtest","r":"task-risk"},artifact_requirements=[ArtifactRequirement(producer_task_id="task-backtest",artifact_type="backtest.metrics"),ArtifactRequirement(producer_task_id="task-risk",artifact_type="risk.audit_report")])
+    ts=TaskStore(rd/"tasks"); ts.save_task(risk); ts.save_task(report)
+    calls=[]; monkeypatch.setattr(rt,"run_worker",lambda *a,**k: calls.append(a) or WorkerResult(status="completed",summary="bad"))
+    runtime._execute_layer(run=run,task_store=ts,agent_map={a.id:a for a in run.agents},layer_task_ids=["task-report"],task_summaries={},run_dir=rd,cancel_event=threading.Event(),include_shell_tools=False,grounding_block="")
+    assert calls == []
+    assert ts.load_task("task-report").status is TaskStatus.blocked
