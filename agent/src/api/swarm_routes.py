@@ -240,6 +240,8 @@ def register_swarm_routes(
         from src.swarm.models import RunStatus
 
         reconciled = runtime._store.reconcile_run(loaded, write=True)
+        if reconciled.execution_identity is not None or getattr(reconciled.preset_capabilities, "source_scoped_execution", False):
+            raise HTTPException(status_code=409, detail="Retry of source-scoped Swarm runs requires trusted identity rehydration and is currently denied.")
         if reconciled.status == RunStatus.running:
             raise HTTPException(
                 status_code=409, detail="Cannot retry a running run. Cancel it first."

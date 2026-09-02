@@ -2807,6 +2807,8 @@ def retry_run(run_id: str, resume: bool = False) -> str:
     # Reconcile first so a zombie "running" run whose host died is demoted
     # before we gate on status; only a genuinely active run blocks retry.
     reconciled = store.reconcile_run(loaded, write=True)
+    if reconciled.execution_identity is not None or getattr(reconciled.preset_capabilities, "source_scoped_execution", False):
+        return json.dumps({"status": "error", "error": "Retry of source-scoped Swarm runs requires trusted identity rehydration and is currently denied."}, ensure_ascii=False)
     if reconciled.status == RunStatus.running:
         return json.dumps(
             {"status": "error", "error": "Cannot retry a running run. Cancel or reap it first."},
