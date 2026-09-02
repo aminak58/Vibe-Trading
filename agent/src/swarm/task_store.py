@@ -9,6 +9,7 @@ from __future__ import annotations
 import threading
 from collections import defaultdict, deque
 from pathlib import Path
+from typing import Any
 
 from src.swarm.models import SwarmTask, TaskStatus
 
@@ -87,7 +88,7 @@ class TaskStore:
         return tasks
 
     def update_status(
-        self, task_id: str, status: TaskStatus, **kwargs: str | int | list[str] | None
+        self, task_id: str, status: TaskStatus, **kwargs: Any
     ) -> SwarmTask:
         """Update task status and additional fields.
 

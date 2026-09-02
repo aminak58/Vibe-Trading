@@ -210,6 +210,27 @@ class SwarmAgentSpec(BaseModel):
     max_retries: int = 2
 
 
+class ArtifactRef(BaseModel):
+    """Server-registered immutable reference to one worker artifact.
+
+    Workers return only candidate run-relative paths.  The runtime validates
+    those paths and computes this record after a task completes, so a worker
+    (or model) cannot claim an artifact from another task or invent its hash.
+    ``artifact_refs`` are deliberately distinct from the legacy ``artifacts``
+    list on :class:`SwarmTask`: the latter remains a backward-compatible list
+    of paths, while this model is the future authority for dependency-scoped
+    artifact handoff.
+    """
+
+    artifact_id: str
+    producer_task_id: str
+    producer_agent_id: str
+    run_relative_path: str
+    sha256: str
+    byte_size: int
+    execution_identity_hash: str | None = None
+
+
 class SwarmTask(BaseModel):
     """A task node in the Swarm DAG.
 
@@ -225,7 +246,8 @@ class SwarmTask(BaseModel):
         input_from: Mapping to pull summaries from upstream tasks, e.g. {"macro": "analyze_macro"}.
         status: Current task status.
         summary: Summary text after completion.
-        artifacts: List of output file paths.
+        artifacts: Legacy list of output file paths.
+        artifact_refs: Server-registered authoritative artifact records.
         error: Error message on failure.
         started_at: ISO-format start time.
         completed_at: ISO-format completion time.
@@ -241,6 +263,7 @@ class SwarmTask(BaseModel):
     status: TaskStatus = TaskStatus.pending
     summary: str | None = None
     artifacts: list[str] = Field(default_factory=list)
+    artifact_refs: list[ArtifactRef] = Field(default_factory=list)
     error: str | None = None
     started_at: str | None = None
     completed_at: str | None = None

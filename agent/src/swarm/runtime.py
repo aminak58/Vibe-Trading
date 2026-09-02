@@ -53,6 +53,7 @@ from src.swarm.task_store import (
 from src.tools.mcp import invalidate_mcp_specs_cache
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import agent_artifact_dir, clear_agent_artifacts, run_worker
+from src.swarm.artifacts import register_task_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -540,12 +541,21 @@ class SwarmRuntime:
                     if result.status == "completed":
                         task_summaries[tid] = result.summary
                         now_iso = datetime.now(timezone.utc).isoformat()
+                        task = task_store.load_task(tid)
+                        artifact_refs = register_task_artifacts(
+                            run_dir=run_dir,
+                            task_id=tid,
+                            agent_id=task.agent_id,
+                            artifact_paths=result.artifact_paths,
+                            execution_identity_hash=run.identity_hash,
+                        )
                         task_store.update_status(
                             tid,
                             TaskStatus.completed,
                             summary=result.summary,
                             completed_at=now_iso,
                             artifacts=result.artifact_paths,
+                            artifact_refs=artifact_refs,
                             worker_iterations=result.iterations,
                         )
                         resolve_dependencies(run_dir / "tasks", tid)
