@@ -62,7 +62,7 @@ class WorkflowObligation(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: str = "workflow-obligation/v2"
+    schema_version: str = "workflow-obligation/v3"
     mode: WorkflowMode = WorkflowMode.NONE
     preset_requirement: PresetRequirement = PresetRequirement()
     # ``requested`` is the literal exact user constraint, if any.  A
@@ -75,6 +75,10 @@ class WorkflowObligation(BaseModel):
     status: WorkflowStatus = WorkflowStatus.PENDING
     identity_hash: str | None = None
     swarm_run_id: str | None = None
+    dispatch_attempted: bool = False
+    launch_id: str | None = None
+    terminal_result_status: str | None = None
+    terminal_reason: str | None = None
     evidence: str = "current_raw_user_message"
 
     @property
@@ -190,20 +194,22 @@ class WorkflowObligationLedger:
         else:
             status = str(payload.get("status") or "").casefold()
             run_id = str(payload.get("run_id") or "") or None
+            if self._obligation.swarm_run_id and run_id and run_id != self._obligation.swarm_run_id:
+                return
             if payload.get("wait_budget_exhausted") or status in {"pending", "running"}:
                 self._obligation = self._obligation.transition(WorkflowStatus.WAITING, swarm_run_id=run_id)
             elif status == "completed":
-                self._obligation = self._obligation.transition(WorkflowStatus.COMPLETED, swarm_run_id=run_id)
+                self._obligation = self._obligation.transition(WorkflowStatus.COMPLETED, swarm_run_id=run_id, terminal_result_status="completed")
             elif status in {"cancelled", "canceled"}:
-                self._obligation = self._obligation.transition(WorkflowStatus.CANCELLED, swarm_run_id=run_id)
+                self._obligation = self._obligation.transition(WorkflowStatus.CANCELLED, swarm_run_id=run_id, terminal_result_status="cancelled")
             else:
-                self._obligation = self._obligation.transition(WorkflowStatus.FAILED, swarm_run_id=run_id)
+                self._obligation = self._obligation.transition(WorkflowStatus.FAILED, swarm_run_id=run_id, terminal_result_status="failed")
         self.persist()
 
     def mark_swarm_started(self) -> None:
         """Record dispatch before a long-running Swarm tool returns."""
         if self._obligation.mode is WorkflowMode.SWARM_REQUIRED:
-            self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED)
+            self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True)
             self.persist()
 
     def record_status_result(self, result: str) -> None:
@@ -260,6 +266,8 @@ class WorkflowObligationLedger:
         if obligation.mode is not WorkflowMode.SWARM_REQUIRED:
             return None
         if tool_name == "run_swarm":
+            if obligation.dispatch_attempted:
+                return _denial(obligation, "This current-user Swarm objective has already consumed its one dispatch attempt.")
             supplied = str(arguments.get("preset_name") or "").casefold() or None
             if obligation.preset_requirement.kind is PresetRequirementKind.EXACT and obligation.required_preset and supplied != obligation.required_preset:
                 return _denial(obligation, "An explicit current-user preset must be used exactly.")

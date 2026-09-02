@@ -191,6 +191,15 @@ def test_failed_swarm_cannot_silently_downgrade_to_direct_backtest(tmp_path: Pat
     assert ledger.block("backtest", {"run_dir": str(tmp_path)}) is not None
 
 
+@pytest.mark.parametrize("status", ["failed", "completed", "cancelled"])
+def test_terminal_swarm_consumes_current_objective_attempt(tmp_path: Path, status: str) -> None:
+    ledger = WorkflowObligationLedger(run_dir=tmp_path, user_message="Run Swarm")
+    ledger.mark_swarm_started()
+    ledger.record_swarm_result(json.dumps({"status": status, "run_id": "swarm-1"}))
+    assert ledger.block("run_swarm", {}) is not None
+    assert ledger.block("backtest", {}) is not None
+
+
 class _BacktestTool(BaseTool):
     name = "backtest"
     description = "Run a backtest."
