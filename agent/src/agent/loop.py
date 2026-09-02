@@ -2360,7 +2360,7 @@ class AgentLoop:
         """
         readonly = self._is_tool_readonly(tool_name)
         invocation_args = dict(args)
-        if tool_name == "run_swarm" and self._execution_identity is not None:
+        if tool_name in {"run_swarm", "backtest"} and self._execution_identity is not None:
             # This value is deliberately not part of the model-facing tool
             # schema. The server owns the current identity snapshot.
             invocation_args["__execution_identity"] = self._execution_identity.snapshot()

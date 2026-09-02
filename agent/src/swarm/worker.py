@@ -1046,6 +1046,12 @@ def _run_worker_impl(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            if tc.name == "backtest" and execution_identity is not None:
+                # Not model-visible and never sourced from task prose.  The
+                # BacktestTool validates generated config.json at this final
+                # boundary before a child process can execute it.
+                args["__execution_identity"] = execution_identity
+                args["__swarm_run_id"] = run_dir.name
             identity_error = _validate_worker_execution_identity(execution_identity, tc.name, args)
             if identity_error is not None:
                 result = json.dumps(identity_error, ensure_ascii=False)

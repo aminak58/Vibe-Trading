@@ -8,6 +8,7 @@ with cancellation and event callback support.
 from __future__ import annotations
 
 import logging
+import json
 import random
 import shutil
 import threading
@@ -41,6 +42,7 @@ from src.swarm.models import (
 )
 from src.swarm.presets import build_run_from_preset
 from src.execution_identity import ExecutionIdentity
+from src.execution_provenance import validate_execution_provenance
 from src.swarm.store import SwarmStore
 from src.swarm.task_store import (
     TaskStore,
@@ -659,6 +661,19 @@ class SwarmRuntime:
                     run.final_report = task_summaries[tid]
                     break
 
+        if run.execution_identity is not None:
+            provenance = self._validate_strict_run_provenance(run, run_dir)
+            run.provenance_validation_status = provenance.status
+            if not provenance.valid:
+                all_succeeded = False
+                run.status = RunStatus.failed
+                run.final_report = (
+                    "PROVENANCE_CONFLICT: strict execution provenance did not match "
+                    "the server-owned Execution Contract (" + "; ".join(provenance.issues) + ")."
+                )
+
+        final_status = run.status
+
         self._store.update_run(run)
         self._emit_event(run_id, self._make_event("run_completed", data={"status": final_status.value}))
 
@@ -666,6 +681,18 @@ class SwarmRuntime:
         with self._lock:
             self._cancel_events.pop(run_id, None)
             self._live_callbacks.pop(run_id, None)
+
+    @staticmethod
+    def _validate_strict_run_provenance(run: SwarmRun, run_dir: Path):
+        """Validate persisted backtest provenance before exposing a strict report."""
+        artifacts = sorted((run_dir / "artifacts").glob("*/execution_provenance.json"))
+        if len(artifacts) != 1:
+            return validate_execution_provenance(run.execution_identity, None, owning_run_id=run.id)
+        try:
+            payload = json.loads(artifacts[0].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        return validate_execution_provenance(run.execution_identity, payload, owning_run_id=run.id)
 
     def _sync_run_tasks_snapshot(self, run: SwarmRun, task_store: TaskStore) -> None:
         """Mirror live ``tasks/*.json`` back into ``run.json`` at a safe point.

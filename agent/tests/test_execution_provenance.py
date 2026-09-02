@@ -8,6 +8,9 @@ from src.execution_identity import (
 )
 from src.execution_provenance import validate_execution_provenance
 from src.agent.loop import AgentLoop
+from src.swarm.runtime import SwarmRuntime
+from types import SimpleNamespace
+import json
 
 
 def _identity() -> ExecutionIdentity:
@@ -48,3 +51,29 @@ def test_active_swarm_blocks_replacement_market_workflow() -> None:
     assert blocked is not None
     assert "swarm_ownership_active" in blocked
     assert allowed is None
+
+
+def test_runtime_reads_persisted_provenance_not_aggregator_prose(tmp_path) -> None:
+    identity = _identity()
+    path = tmp_path / "artifacts" / "backtester"
+    path.mkdir(parents=True)
+    (path / "execution_provenance.json").write_text(
+        json.dumps(
+            {
+                "identity_hash": identity.identity_hash,
+                "owning_run_id": "swarm-1",
+                "requested_symbol": "XAUUSD",
+                "resolved_symbol": "XAUUSD_o",
+                "effective_source": "mt5",
+                "synthetic": False,
+                "fallback_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = SwarmRuntime._validate_strict_run_provenance(
+        SimpleNamespace(execution_identity=identity, id="swarm-1"),
+        tmp_path,
+    )
+    assert result.status == "passed"

@@ -96,7 +96,7 @@ def test_incident_context_cannot_mutate_verified_mt5_identity() -> None:
     identity = _verified_mt5_identity()
     incident_prompt = (
         "Run the attached XAUUSD MetaTrader/MQL5 research request. "
-        "Historical memory discussed XAUT-USDT on OKX and yfinance."
+        "Historical memory discussed BTCUSD, YM, XAUT-USDT on OKX and yfinance."
     )
 
     variables = _build_variables("quant_scalp_desk", incident_prompt, execution_identity=identity)
@@ -111,6 +111,17 @@ def test_incident_context_cannot_mutate_verified_mt5_identity() -> None:
     assert run.identity_hash == identity.identity_hash
     assert blocked is not None
     assert blocked["error_code"] == "identity_blocked"
+
+
+def test_quant_scalp_preset_has_no_hard_coded_execution_identity() -> None:
+    from src.swarm.presets import resolve_preset_path
+
+    text = resolve_preset_path("quant_scalp_desk").read_text(encoding="utf-8")
+    # Alternative providers may be named only to prohibit them.  These are
+    # formerly operational preset defaults and must no longer appear at all.
+    for forbidden in ('XAUUSD_o', 'BTCUSD', 'YM', 'XAUT-USDT'):
+        assert forbidden not in text
+    assert "Execution Contract" in text
 
 
 def test_public_swarm_schema_cannot_issue_authoritative_identity() -> None:
