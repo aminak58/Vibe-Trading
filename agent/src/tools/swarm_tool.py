@@ -743,6 +743,8 @@ class SwarmTool(BaseTool):
         prompt = kwargs.get("prompt", "")
         execution_identity = kwargs.get("__execution_identity")
         owner_session_id = kwargs.get("__owner_session_id")
+        on_started = kwargs.get("__on_swarm_started")
+        cancel_event = kwargs.get("__cancel_event")
 
         if not prompt:
             return json.dumps(
@@ -849,6 +851,8 @@ class SwarmTool(BaseTool):
             )
 
         run_id = run.id
+        if callable(on_started):
+            on_started(run_id)
         run_id_holder["run_id"] = run_id
         logger.info("SwarmTool: started run %s (preset=%s)", run_id, preset)
         self._emit_session_event(
@@ -872,6 +876,7 @@ class SwarmTool(BaseTool):
         t0 = time.monotonic()
         max_wait = _max_wait_seconds()
         while time.monotonic() - t0 < max_wait:
+            _cancel_owned_run_if_requested(runtime, run_id, cancel_event)
             time.sleep(_POLL_INTERVAL_SECONDS)
 
             loaded = store.load_run(run_id)
@@ -900,6 +905,12 @@ class SwarmTool(BaseTool):
             {"status": "timeout", "error": f"Swarm run {run_id} timed out after {max_wait}s"},
             ensure_ascii=False,
         )
+
+
+def _cancel_owned_run_if_requested(runtime: Any, run_id: str, cancel_event: Any) -> None:
+    """Cascade only the owning AgentLoop cancellation into this Swarm run."""
+    if getattr(cancel_event, "is_set", lambda: False)():
+        runtime.cancel_run(run_id)
 
 
 def _format_result(

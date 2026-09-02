@@ -1085,6 +1085,27 @@ class SwarmRuntime:
                         and verify_registered_artifact(run_dir, ref)
                         for ref in producer.artifact_refs
                     )
+                    if valid_ref and requirement.artifact_type == "risk.audit_report":
+                        backtester = task_store.load_task("task-backtest")
+                        granted = {
+                            ref.artifact_id for ref in backtester.artifact_refs
+                            if ref.producer_run_id == run.id
+                            and ref.producer_task_id == "task-backtest"
+                            and ref.provenance_status == "passed"
+                            and ref.execution_identity_hash == run.identity_hash
+                            and verify_registered_artifact(run_dir, ref)
+                        }
+                        valid_ref = any(
+                            ref.producer_run_id == run.id
+                            and ref.producer_task_id == requirement.producer_task_id
+                            and ref.artifact_type == "risk.audit_report"
+                            and ref.provenance_status == "passed"
+                            and ref.execution_identity_hash == run.identity_hash
+                            and set(ref.derived_from_artifact_ids).issubset(granted)
+                            and bool(ref.derived_from_artifact_ids)
+                            and verify_registered_artifact(run_dir, ref)
+                            for ref in producer.artifact_refs
+                        )
                     if requirement.required and not valid_ref:
                         missing_requirements.append(f"{requirement.producer_task_id}/{requirement.artifact_type}")
                 if missing_requirements:

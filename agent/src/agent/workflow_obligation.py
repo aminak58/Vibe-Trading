@@ -212,6 +212,11 @@ class WorkflowObligationLedger:
             self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True)
             self.persist()
 
+    def bind_swarm_run(self, run_id: str) -> None:
+        if self._obligation.mode is WorkflowMode.SWARM_REQUIRED and self._obligation.dispatch_attempted and not self._obligation.swarm_run_id:
+            self._obligation = self._obligation.transition(self._obligation.status, swarm_run_id=run_id)
+            self.persist()
+
     def record_status_result(self, result: str) -> None:
         if self._obligation.mode is not WorkflowMode.SWARM_REQUIRED:
             return
