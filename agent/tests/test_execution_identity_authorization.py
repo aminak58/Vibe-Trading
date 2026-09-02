@@ -71,3 +71,21 @@ def test_verified_mt5_identity_allows_requested_and_resolved_alias(tmp_path) -> 
             call_id=symbol,
         )
         assert decision.allowed is True
+
+
+def test_prohibited_symbol_list_does_not_seed_grounding_identity(tmp_path) -> None:
+    execution = ExecutionIdentityLedger(
+        run_dir=tmp_path,
+        user_message="requested symbol: XAUUSD\nsource: mt5",
+    )
+    ledger = GroundingLedger(
+        run_dir=tmp_path,
+        user_message=(
+            "requested symbol: XAUUSD\nsource: mt5\n"
+            "Do not substitute:\n- XAUT-USDT\n- GC=F\n- PAXG"
+        ),
+        execution_identity=execution.snapshot(),
+    )
+
+    assert "XAUT-USDT" not in ledger.authorized_symbols
+    assert "GC=F" not in ledger.authorized_symbols

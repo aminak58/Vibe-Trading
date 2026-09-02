@@ -27,11 +27,16 @@ from src.execution_identity import (
 EXECUTION_IDENTITY_ARTIFACT = "execution_identity.json"
 _EXPLICIT_SOURCE_RE = re.compile(r"\bsource\s*(?:=|:)\s*['\"]?([a-z0-9_-]+)", re.IGNORECASE)
 _SYMBOL_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,11}(?:[./_-][A-Z0-9]{1,11})?\b")
+_DECLARED_SYMBOL_RE = re.compile(
+    r"(?:^|\n)\s*(?:requested\s+)?(?:symbol|ticker|instrument)\s*[:=]\s*([^\n]+)",
+    re.IGNORECASE,
+)
 _DECLARED_FIELD_RE = re.compile(
     r"(?:^|\n)\s*(?:required\s+)?(symbol|instrument|asset|source|platform)\s*[:=]\s*([^\n]+)",
     re.IGNORECASE,
 )
 _REQUIREMENT_WORD_RE = re.compile(r"\b(?:must|required|only|use)\b", re.IGNORECASE)
+_QUOTE_CURRENCY_SUFFIXES = ("USDT", "USDC", "USD", "EUR", "JPY", "GBP", "CHF", "AUD", "CAD")
 
 
 class ExecutionIdentityLedger:
@@ -260,10 +265,24 @@ class ExecutionIdentityLedger:
 
 
 def _first_symbol(value: str) -> str | None:
-    for match in _SYMBOL_RE.finditer(value or ""):
+    """Return an explicit or structurally credible requested symbol.
+
+    Execution identity must fail unresolved rather than mistake document titles,
+    indicator names, or all-caps prose (for example ``VWAP``) for an instrument.
+    A labelled current-task declaration wins; the fallback accepts only a
+    delimiter-qualified identifier or a conventional quote-currency pair.
+    """
+    declared = _DECLARED_SYMBOL_RE.search(value or "")
+    candidates = _SYMBOL_RE.finditer(declared.group(1) if declared else value or "")
+    for match in candidates:
         candidate = match.group(0).upper()
         if candidate not in {"PDF", "MT5", "MQL5", "HTTP", "UTC"}:
-            return candidate
+            if declared:
+                return candidate
+            if any(separator in candidate for separator in (".", "/", "_", "-")):
+                return candidate
+            if candidate.endswith(_QUOTE_CURRENCY_SUFFIXES):
+                return candidate
     return None
 
 

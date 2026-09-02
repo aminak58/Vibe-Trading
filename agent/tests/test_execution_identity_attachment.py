@@ -16,6 +16,29 @@ def test_raw_user_source_creates_strict_partial_identity(tmp_path) -> None:
     assert ledger.identity.requests[0].symbol == "XAUUSD"
 
 
+def test_explicit_symbol_declaration_beats_pdf_title_indicator(tmp_path) -> None:
+    ledger = ExecutionIdentityLedger(
+        run_dir=tmp_path,
+        user_message=(
+            "[Uploaded file: Gold VWAP strategy.pdf]\n"
+            "Run strict research.\n"
+            "requested symbol: XAUUSD\n"
+            "source: mt5"
+        ),
+    )
+
+    assert ledger.identity.requests[0].symbol == "XAUUSD"
+
+
+def test_indicator_title_is_not_treated_as_a_requested_symbol(tmp_path) -> None:
+    ledger = ExecutionIdentityLedger(
+        run_dir=tmp_path,
+        user_message="[Uploaded file: VWAP strategy.pdf]\nsource: mt5",
+    )
+
+    assert ledger.identity.requests[0].symbol is None
+
+
 def test_declared_attachment_requirement_enriches_identity(tmp_path) -> None:
     ledger = ExecutionIdentityLedger(run_dir=tmp_path, user_message="Run the attached strategy")
     result = json.dumps(

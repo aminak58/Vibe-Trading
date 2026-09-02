@@ -776,6 +776,38 @@ def _scan_symbols(text: str) -> set[str]:
     }
 
 
+_NEGATED_SYMBOL_CONTEXT_RE = re.compile(
+    r"\b(?:do\s+not|don't|must\s+not|not\s+(?:use|substitute)|avoid|without)\b",
+    re.IGNORECASE,
+)
+
+
+def _scan_user_asserted_symbols(text: str) -> set[str]:
+    """Return user-authorized symbols while excluding prohibition lists.
+
+    A current request can name alternatives solely to forbid them.  Such text
+    is useful policy context, but must never seed the identity ledger or widen
+    a strict execution surface.  A colon-introduced prohibition keeps applying
+    to its bullet list until the next blank/non-bullet line.
+    """
+    symbols: set[str] = set()
+    in_prohibition_list = False
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            in_prohibition_list = False
+            continue
+        if _NEGATED_SYMBOL_CONTEXT_RE.search(line):
+            in_prohibition_list = line.endswith(":")
+            continue
+        if in_prohibition_list and re.match(r"^(?:[-*]|\d+[.)])\s*", line):
+            continue
+        if not re.match(r"^(?:[-*]|\d+[.)])\s*", line):
+            in_prohibition_list = False
+        symbols.update(_scan_symbols(line))
+    return symbols
+
+
 def _infer_venue(symbol: str) -> str | None:
     """Infer a coarse venue from a project symbol."""
     upper = _normalize_symbol(symbol)
@@ -971,7 +1003,7 @@ class GroundingLedger:
         self._buffer_output = self._identity_required
         # Every instrument this run is entitled to write about: the ones the
         # user named, plus the ones a succeeding tool call passed in or returned.
-        self._session_symbols: set[str] = _scan_symbols(user_message)
+        self._session_symbols: set[str] = _scan_user_asserted_symbols(user_message)
         # Bare tickers a succeeding call passed in, e.g. "AAPL" for the nine
         # tools whose contract is a bare US ticker. "AAPL.US" in the answer then
         # names an instrument the run really handled.
@@ -1669,8 +1701,7 @@ class GroundingLedger:
 
     def _seed_symbols(self, text: str, *, source: str) -> None:
         """Lock exact symbols explicitly supplied by a user."""
-        for match in _CANONICAL_SYMBOL_RE.finditer(text or ""):
-            symbol = _normalize_symbol(match.group(0))
+        for symbol in _scan_user_asserted_symbols(text):
             key = f"explicit:{symbol}"
             existing = self._identities.get(key)
             version = existing.version + 1 if existing else 1
