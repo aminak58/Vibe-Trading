@@ -11,6 +11,7 @@ import json
 import re
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -32,19 +33,54 @@ class WorkflowStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class PresetRequirementKind(str, Enum):
+    """How a current user constrained the required Swarm preset."""
+
+    NONE = "none"
+    EXACT = "exact"
+    CAPABILITY = "capability"
+
+
+class PresetRequirement(BaseModel):
+    """Bounded, current-user-only preset requirement.
+
+    ``CAPABILITY`` intentionally contains no prose-derived provider, market,
+    or preset name.  The only P0 capability directive is an existing preset
+    metadata field: source-scoped execution.  Identity compatibility is
+    evaluated separately against the verified server-owned identity.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: PresetRequirementKind = PresetRequirementKind.NONE
+    exact_name: str | None = None
+    source_scoped_execution: bool = False
+
+
 class WorkflowObligation(BaseModel):
     """Immutable-ish persisted state for a current-user workflow requirement."""
 
     model_config = ConfigDict(frozen=True)
 
-    schema_version: str = "workflow-obligation/v1"
+    schema_version: str = "workflow-obligation/v2"
     mode: WorkflowMode = WorkflowMode.NONE
-    required_preset: str | None = None
+    preset_requirement: PresetRequirement = PresetRequirement()
+    # ``requested`` is the literal exact user constraint, if any.  A
+    # capability directive deliberately has no requested preset; its selected
+    # preset is a later, server-side result that remains auditable on restart.
+    requested_preset: str | None = None
+    selected_preset: str | None = None
+    selection_reason: str | None = None
     authority: str = "current_user"
     status: WorkflowStatus = WorkflowStatus.PENDING
     identity_hash: str | None = None
     swarm_run_id: str | None = None
     evidence: str = "current_raw_user_message"
+
+    @property
+    def required_preset(self) -> str | None:
+        """Compatibility accessor for exact-preset callers and diagnostics."""
+        return self.requested_preset
 
     def transition(self, status: WorkflowStatus, **updates: str | None) -> "WorkflowObligation":
         return self.model_copy(update={"status": status, **updates})
@@ -52,20 +88,65 @@ class WorkflowObligation(BaseModel):
 
 # This deliberately has a narrow vocabulary.  Do not turn ordinary historic
 # prose, summaries, or broad words such as "analysis" into an obligation.
-_SWARM_RE = re.compile(r"\b(?:run|use|start|launch)\s+(?:the\s+)?swarm\b|\bswarm\s+(?:workflow|team|analysis)\b", re.IGNORECASE)
-_PRESET_RE = re.compile(r"\b(quant_scalp_desk)\b", re.IGNORECASE)
+_ACTION = r"(?:run|use|start|launch|execute)"
+_SWARM_DIRECTIVE_RE = re.compile(
+    rf"\b{_ACTION}\b(?:\s+(?:this|it|the\s+(?:task|request|workflow)))?\s+(?:(?:with|through)\s+)?(?:a\s+)?swarm\b(?:\s+(?:workflow|team|preset))?",
+    re.IGNORECASE,
+)
+_CAPABILITY_DIRECTIVE_RE = re.compile(
+    rf"\b{_ACTION}\b(?:\s+(?:this|it|the\s+(?:task|request|workflow)))?\s+(?:with\s+)?(?:the\s+|a\s+)?(?:strict-capable|source-aware)\s+swarm\s+preset\b",
+    re.IGNORECASE,
+)
+_PRESET_DIRECTIVE_RE = re.compile(
+    rf"\b{_ACTION}\b(?:\s+(?:this|it|the\s+(?:task|request|workflow)))?\s+(?:with\s+)?(?:the\s+)?(quant_scalp_desk)\b",
+    re.IGNORECASE,
+)
+_NEGATED_SWARM_RE = re.compile(r"\b(?:do\s+not|don't|without|avoid|never)\s+(?:(?:use|run|start|launch|execute)\s+)?(?:the\s+)?swarm\b", re.IGNORECASE)
+_NON_DIRECTIVE_SWARM_RE = re.compile(
+    r"\b(?:should\s+(?:we|i)\s+use|may\s+be\s+useful|previous|last|failed\s+yesterday)\s+(?:the\s+)?swarm\b"
+    r"|\bswarm\s+(?:may\s+be\s+useful|failed\s+yesterday)\b",
+    re.IGNORECASE,
+)
+_QUOTED_RE = re.compile(r"(?P<quote>['\"])(?:\\.|(?!\1).)*(?P=quote)")
+_CODE_SPAN_RE = re.compile(r"`[^`]*`")
+_BLOCK_QUOTE_RE = re.compile(r"(?m)^\s*>.*$")
+
+
+def _directive_text(user_message: str) -> str:
+    """Remove quoted examples; only an affirmative current instruction counts."""
+    text = user_message or ""
+    text = _BLOCK_QUOTE_RE.sub(" ", text)
+    text = _CODE_SPAN_RE.sub(" ", text)
+    return _QUOTED_RE.sub(" ", text)
 
 
 def obligation_from_current_user_message(user_message: str) -> WorkflowObligation:
     """Parse only this turn's raw user message into a bounded obligation."""
-    text = user_message or ""
-    preset_match = _PRESET_RE.search(text)
-    preset = preset_match.group(1).casefold() if preset_match else None
-    if _SWARM_RE.search(text) or preset is not None:
+    text = _directive_text(user_message)
+    if _NEGATED_SWARM_RE.search(text) or _NON_DIRECTIVE_SWARM_RE.search(text):
+        return WorkflowObligation(mode=WorkflowMode.NONE)
+    preset_match = _PRESET_DIRECTIVE_RE.search(text)
+    if preset_match:
         return WorkflowObligation(
             mode=WorkflowMode.SWARM_REQUIRED,
-            required_preset=preset,
+            preset_requirement=PresetRequirement(
+                kind=PresetRequirementKind.EXACT,
+                exact_name=preset_match.group(1).casefold(),
+            ),
+            requested_preset=preset_match.group(1).casefold(),
+            selected_preset=preset_match.group(1).casefold(),
+            selection_reason="explicit_user_request",
         )
+    if _CAPABILITY_DIRECTIVE_RE.search(text):
+        return WorkflowObligation(
+            mode=WorkflowMode.SWARM_REQUIRED,
+            preset_requirement=PresetRequirement(
+                kind=PresetRequirementKind.CAPABILITY,
+                source_scoped_execution=True,
+            ),
+        )
+    if _SWARM_DIRECTIVE_RE.search(text):
+        return WorkflowObligation(mode=WorkflowMode.SWARM_REQUIRED)
     return WorkflowObligation(mode=WorkflowMode.NONE)
 
 
@@ -141,6 +222,38 @@ class WorkflowObligationLedger:
             self._obligation = self._obligation.transition(terminal[status])
             self.persist()
 
+    def prepare_run_swarm(self, arguments: dict[str, Any], identity: Any | None) -> str | None:
+        """Resolve a bounded capability requirement into one server-selected preset.
+
+        The model never supplies the selection.  A capability directive needs
+        a verified identity so preset metadata can be checked deterministically.
+        """
+        requirement = self._obligation.preset_requirement
+        if requirement.kind is not PresetRequirementKind.CAPABILITY:
+            return None
+        if identity is None or getattr(getattr(identity, "status", None), "value", None) != "verified":
+            return _denial(self._obligation, "Resolve the execution identity before selecting a capability-required Swarm preset.")
+        from src.swarm.presets import resolve_source_scoped_preset
+
+        selected, error = resolve_source_scoped_preset(
+            identity,
+            require_synthetic_forbid=requirement.source_scoped_execution,
+        )
+        if error:
+            return _denial(self._obligation, error)
+        assert selected is not None
+        supplied = str(arguments.get("preset_name") or "").casefold() or None
+        if supplied is not None and supplied != selected:
+            return _denial(self._obligation, "The capability-required Swarm preset is selected server-side and cannot be replaced.")
+        self._obligation = self._obligation.transition(
+            self._obligation.status,
+            selected_preset=selected,
+            selection_reason="capability_match",
+        )
+        self.persist()
+        arguments["preset_name"] = selected
+        return None
+
     def block(self, tool_name: str, arguments: dict) -> str | None:
         """Return a structured denial for a topology-changing tool call."""
         obligation = self._obligation
@@ -148,7 +261,7 @@ class WorkflowObligationLedger:
             return None
         if tool_name == "run_swarm":
             supplied = str(arguments.get("preset_name") or "").casefold() or None
-            if obligation.required_preset and supplied != obligation.required_preset:
+            if obligation.preset_requirement.kind is PresetRequirementKind.EXACT and obligation.required_preset and supplied != obligation.required_preset:
                 return _denial(obligation, "An explicit current-user preset must be used exactly.")
             return None
         # Source resolution, document extraction, market-data inspection, and
@@ -160,7 +273,27 @@ class WorkflowObligationLedger:
 
     def _load(self) -> WorkflowObligation | None:
         try:
-            return WorkflowObligation.model_validate_json((self.run_dir / WORKFLOW_OBLIGATION_ARTIFACT).read_text(encoding="utf-8"))
+            raw = json.loads((self.run_dir / WORKFLOW_OBLIGATION_ARTIFACT).read_text(encoding="utf-8"))
+            # Preserve the only v1 constraint while safely loading a live
+            # running/waiting Swarm after deployment.  New artifacts always
+            # persist v2's requested/selected split.
+            if isinstance(raw, dict) and raw.get("schema_version") == "workflow-obligation/v1":
+                exact = raw.get("required_preset")
+                if exact:
+                    raw.update(
+                        {
+                            "schema_version": "workflow-obligation/v2",
+                            "preset_requirement": {
+                                "kind": PresetRequirementKind.EXACT.value,
+                                "exact_name": str(exact).casefold(),
+                                "source_scoped_execution": False,
+                            },
+                            "requested_preset": str(exact).casefold(),
+                            "selected_preset": str(exact).casefold(),
+                            "selection_reason": "legacy_v1_exact_preset",
+                        }
+                    )
+            return WorkflowObligation.model_validate(raw)
         except (OSError, ValueError):
             return None
 
@@ -179,6 +312,7 @@ def _denial(obligation: WorkflowObligation, message: str) -> str:
             "message": message,
             "required_mode": obligation.mode.value,
             "required_preset": obligation.required_preset,
+            "preset_requirement": obligation.preset_requirement.model_dump(mode="json"),
             "obligation_status": obligation.status.value,
         },
         ensure_ascii=False,

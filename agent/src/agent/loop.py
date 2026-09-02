@@ -2046,6 +2046,14 @@ class AgentLoop:
                     identity = execution_identity.snapshot()
                     if identity.status.value == "verified":
                         workflow_obligation.bind_identity(identity.identity_hash)
+                if tc.name == "run_swarm":
+                    capability_block = workflow_obligation.prepare_run_swarm(
+                        tc.arguments,
+                        identity if execution_identity is not None else None,
+                    )
+                    if capability_block is not None:
+                        execution_plan.append((tc, capability_block))
+                        continue
                 obligation_block = workflow_obligation.block(tc.name, tc.arguments)
                 if obligation_block is not None:
                     execution_plan.append((tc, obligation_block))

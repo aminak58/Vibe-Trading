@@ -156,6 +156,52 @@ def validate_preset_identity(
     return capabilities
 
 
+def resolve_source_scoped_preset(
+    identity: ExecutionIdentity,
+    *,
+    require_synthetic_forbid: bool = False,
+) -> tuple[str | None, str | None]:
+    """Return one strict-capable preset, or a safe ambiguity/unavailable error.
+
+    This is deliberately not the prose/keyword router.  It reads only
+    declarative preset metadata and validates each candidate against the
+    verified server-owned execution identity.  More than one match is never
+    guessed: callers must request an exact preset or obtain clarification.
+    """
+    if identity.status.value != "verified":
+        return None, "The execution identity must be verified before capability-based preset selection."
+
+    candidates: list[str] = []
+    for directory in _preset_search_dirs():
+        if not directory.exists():
+            continue
+        for path in sorted(directory.glob("*.yaml")):
+            name = path.stem
+            # A user preset shadows a bundled one under the normal loader
+            # rules.  Let validation/load_preset observe that same behavior.
+            if name in candidates:
+                continue
+            try:
+                capabilities = preset_capabilities(name)
+                if capabilities is None or not capabilities.source_scoped_execution:
+                    continue
+                if require_synthetic_forbid and capabilities.synthetic_data != "forbid":
+                    continue
+                validate_preset_identity(name, identity)
+            except (FileNotFoundError, ValueError):
+                continue
+            candidates.append(name)
+
+    if not candidates:
+        return None, "No installed Swarm preset satisfies the explicit capability requirement for this verified execution identity."
+    if len(candidates) > 1:
+        return None, (
+            "More than one installed Swarm preset satisfies the explicit capability requirement "
+            f"({', '.join(candidates)}); request an exact preset rather than guessing."
+        )
+    return candidates[0], None
+
+
 def list_presets() -> list[dict]:
     """Return summary info for all available presets, sorted by name.
 
