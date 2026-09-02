@@ -1242,13 +1242,35 @@ def main(run_dir: Path) -> None:
         print(json.dumps({"error": f"SignalEngine interface error: {exc}"}))
         sys.exit(1)
 
-    fetch_result = fetch_data_map(config)
-    data_map = fetch_result.data_map
-    codes = fetch_result.codes
-    source = fetch_result.source
-    loader = fetch_result.loader
-    config["codes"] = codes
-    config["_run_card_effective_sources"] = fetch_result.effective_sources
+    # Explicit MT5 requests must arrive as a parent-created immutable snapshot.
+    # Do not initialize MT5 or run the generic fallback chain in the sandboxed
+    # child: the child is intentionally untrusted generated-strategy territory.
+    if source == "mt5":
+        if not config.get("mt5_snapshot_manifest"):
+            print(json.dumps({
+                "error": "MT5-backed data acquisition/handoff failure: parent snapshot manifest is required"
+            }))
+            sys.exit(1)
+        try:
+            from backtest.mt5_snapshot import load_mt5_snapshot
+
+            frame, manifest = load_mt5_snapshot(run_dir, config)
+        except Exception as exc:  # noqa: BLE001 - strict child handoff boundary
+            print(json.dumps({"error": f"MT5-backed data acquisition/handoff failure: {exc}"}))
+            sys.exit(1)
+        codes = list(config.get("codes") or [])
+        data_map = {codes[0]: frame}
+        loader = _AutoLoader(data_map)
+        config["_run_card_effective_sources"] = ["mt5"]
+        config["_mt5_snapshot_provenance"] = manifest
+    else:
+        fetch_result = fetch_data_map(config)
+        data_map = fetch_result.data_map
+        codes = fetch_result.codes
+        source = fetch_result.source
+        loader = fetch_result.loader
+        config["codes"] = codes
+        config["_run_card_effective_sources"] = fetch_result.effective_sources
     interval = config.get("interval", "1D")
     if not data_map:
         print(json.dumps({"error": "No data fetched"}))

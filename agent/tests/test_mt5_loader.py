@@ -177,6 +177,7 @@ class TestIntervalsAndFrames:
         frame = frames["EUR/USD"]  # keyed by the ORIGINAL input code
         assert list(frame.columns) == ["open", "high", "low", "close", "volume"]
         assert frame.index.name == "trade_date"
+        assert str(frame.index.tz) == "UTC"
         assert frame["volume"].tolist() == [1200, 1300, 1400]  # tick_volume
         assert frame["close"].iloc[-1] == pytest.approx(1.10)
 

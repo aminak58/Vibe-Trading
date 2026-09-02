@@ -2076,6 +2076,11 @@ class BaseEngine(ABC):
 
         # Metrics
         flat_metrics = {k: v for k, v in metrics.items() if not isinstance(v, dict)}
+        cost_model = self.config.get("cost_model")
+        if isinstance(cost_model, dict) and self.config.get("source") == "mt5":
+            flat_metrics["cost_model_version"] = cost_model.get("version")
+            flat_metrics["cost_model_mode"] = cost_model.get("mode")
+            flat_metrics["cost_grounding"] = str(cost_model.get("mode", "")).upper()
         pd.DataFrame([flat_metrics]).to_csv(out / "metrics.csv", index=False)
 
     # ── Helpers ──

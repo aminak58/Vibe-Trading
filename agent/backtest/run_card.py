@@ -73,6 +73,19 @@ def write_run_card(
     normalized_refs = _normalize_artifact_refs(artifact_refs)
     if normalized_refs:
         card["artifact_refs"] = normalized_refs
+    mt5_snapshot = config.get("_mt5_snapshot_provenance")
+    if isinstance(mt5_snapshot, Mapping):
+        # The immutable handoff manifest is the audit source of truth. Copy
+        # only non-sensitive instrument/data identity fields into the run card.
+        keys = (
+            "schema_version", "source", "requested_symbol", "resolved_symbol",
+            "broker_server", "timeframe", "requested_start", "requested_end",
+            "actual_start", "actual_end", "row_count", "snapshot_path", "sha256",
+            "timestamp_timezone", "timestamp_encoding", "timestamp_representation",
+            "timezone_confidence",
+            "cost_model",
+        )
+        card["mt5_snapshot"] = {key: mt5_snapshot.get(key) for key in keys if key in mt5_snapshot}
     if "validation" in metrics:
         card["validation"] = metrics["validation"]
 
@@ -203,6 +216,26 @@ def _render_markdown(card: Mapping[str, Any]) -> str:
     lines.extend(["", "## Data Sources"])
     data_sources = card.get("data_sources", [])
     lines.extend(f"- {source}" for source in data_sources) if data_sources else lines.append("- None recorded.")
+
+    mt5_snapshot = card.get("mt5_snapshot")
+    if isinstance(mt5_snapshot, Mapping):
+        lines.extend(["", "## MT5 Data and Cost Provenance"])
+        for key in (
+            "requested_symbol", "resolved_symbol", "sha256", "timestamp_timezone",
+            "timestamp_representation",
+        ):
+            if key in mt5_snapshot:
+                lines.append(f"- {key}: {mt5_snapshot[key]}")
+        cost_model = mt5_snapshot.get("cost_model")
+        if isinstance(cost_model, Mapping):
+            lines.append(f"- cost_grounding: {str(cost_model.get('mode', '')).upper()}")
+            for component in ("spread", "slippage", "commission", "swap"):
+                value = cost_model.get(component)
+                if isinstance(value, Mapping):
+                    lines.append(
+                        f"- {component}: method={value.get('method')}, unit={value.get('unit')}, "
+                        f"provenance={value.get('provenance')}"
+                    )
 
     lines.extend(["", "## Metrics"])
     metric_values = card.get("metrics", {})

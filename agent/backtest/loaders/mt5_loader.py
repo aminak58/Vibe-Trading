@@ -147,22 +147,32 @@ def _resolve_broker_symbol(mt5: ModuleType, code: str) -> str | None:
     return matches[0]
 
 
-def _rates_to_frame(rates: Any, start_date: str, end_date: str) -> pd.DataFrame | None:
+def _rates_to_frame(
+    rates: Any, start_date: str, end_date: str, *, include_spread: bool = False
+) -> pd.DataFrame | None:
     """Map a ``copy_rates_range`` structured array to the loader frame contract."""
     if rates is None or len(rates) == 0:
         return None
     frame = pd.DataFrame(rates)
     if "time" not in frame.columns or "close" not in frame.columns:
         return None
-    frame["trade_date"] = pd.to_datetime(frame["time"], unit="s")
+    # MetaTrader5 returns UTC Unix epochs for bar-open times.  Preserve that
+    # source identity rather than retaining UTC-looking, timezone-naive values.
+    frame["trade_date"] = pd.to_datetime(frame["time"], unit="s", utc=True)
     frame = frame.set_index("trade_date").sort_index()
     # Forex real_volume is zero on most brokers; tick_volume is the standard proxy.
     frame["volume"] = frame.get("tick_volume", 0)
     # Bars carry intraday timestamps; the end date is inclusive of its whole day.
-    start = pd.Timestamp(start_date)
-    end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+    start = pd.Timestamp(start_date, tz="UTC")
+    end = pd.Timestamp(end_date, tz="UTC") + pd.Timedelta(days=1)
     frame = frame[(frame.index >= start) & (frame.index < end)]
-    frame = frame[["open", "high", "low", "close", "volume"]].dropna()
+    columns = ["open", "high", "low", "close", "volume"]
+    if include_spread:
+        if "spread" not in frame.columns:
+            return None
+        frame["spread_points"] = pd.to_numeric(frame["spread"], errors="coerce")
+        columns.append("spread_points")
+    frame = frame[columns].dropna(subset=["open", "high", "low", "close", "volume"])
     frame = validate_ohlc(frame)
     return frame if not frame.empty else None
 
@@ -227,7 +237,13 @@ class DataLoader:
         return result
 
     def _fetch_one(
-        self, code: str, start_date: str, end_date: str, timeframe_name: str
+        self,
+        code: str,
+        start_date: str,
+        end_date: str,
+        timeframe_name: str,
+        *,
+        include_spread: bool = False,
     ) -> pd.DataFrame | None:
         """Fetch one symbol from the terminal (``None`` on any failure)."""
         mt5 = _import_mt5()
@@ -247,4 +263,4 @@ class DataLoader:
         except Exception as exc:  # noqa: BLE001 - terminal hiccups degrade, not raise
             logger.warning("mt5: rates fetch failed for %s (%s): %s", code, name, exc)
             return None
-        return _rates_to_frame(rates, start_date, end_date)
+        return _rates_to_frame(rates, start_date, end_date, include_spread=include_spread)

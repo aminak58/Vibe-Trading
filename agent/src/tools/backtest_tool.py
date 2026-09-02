@@ -126,6 +126,27 @@ def run_backtest(
     if config["source"] not in VALID_SOURCES:
         return json.dumps({"status": "error", "error": f"source must be one of {VALID_SOURCES}, got: {config['source']}"}, ensure_ascii=False)
 
+    # MT5's terminal IPC is process/environment-sensitive. Acquire broker bars
+    # before crossing into the generated-strategy sandbox, then make the child
+    # consume only an immutable verified snapshot. Explicit MT5 requests are
+    # intentionally fail-closed: no loader fallback is allowed here or below.
+    if config["source"] == "mt5":
+        try:
+            from backtest.mt5_snapshot import MANIFEST_RELATIVE_PATH, prepare_mt5_snapshot
+
+            manifest = prepare_mt5_snapshot(run_path, config)
+            config["mt5_snapshot_manifest"] = MANIFEST_RELATIVE_PATH.as_posix()
+            config["mt5_snapshot_sha256"] = manifest["sha256"]
+            # The child receives only this parent-resolved immutable contract;
+            # it must not look up broker costs or retain request-time defaults.
+            config["cost_model"] = manifest["cost_model"]
+            _persist_config(config_path, config)
+        except Exception as exc:  # noqa: BLE001 - surface one strict handoff envelope
+            return json.dumps(
+                {"status": "error", "error": f"MT5-backed data acquisition/handoff failure: {exc}"},
+                ensure_ascii=False,
+            )
+
     if execution_identity is not None:
         try:
             _persist_config(config_path, config)
@@ -166,14 +187,18 @@ def run_backtest(
 
     emit_progress("finalize", message="collecting artifacts")
     artifacts_found = {name: str(path) for name, path in result.artifacts.items()}
-    return json.dumps({
+    response = {
         "status": "ok" if result.success else "error",
         "exit_code": result.exit_code,
         "stdout": result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout,
         "stderr": result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr,
         "artifacts": artifacts_found,
         "run_dir": run_dir,
-    }, ensure_ascii=False)
+    }
+    if config.get("source") == "mt5" and isinstance(config.get("cost_model"), dict):
+        response["cost_grounding"] = str(config["cost_model"].get("mode", "")).upper()
+        response["cost_model"] = config["cost_model"]
+    return json.dumps(response, ensure_ascii=False)
 
 
 class BacktestTool(BaseTool):

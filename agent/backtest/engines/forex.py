@@ -100,11 +100,37 @@ class ForexEngine(BaseEngine):
     def __init__(self, config: dict):
         config = {**config, "leverage": config.get("leverage", 100.0)}
         super().__init__(config)
-        self.spread_override = config.get("spread_pips_override")
         self.lot_size: float = config.get("lot_size", STANDARD_LOT)
-        self.swap_enabled: bool = config.get("swap_enabled", True)
-        self.slippage_pips: float = config.get("slippage_pips", 0.3)
+        self._mt5_cost_model = config.get("cost_model") if config.get("source") == "mt5" else None
+        if config.get("source") == "mt5":
+            if not isinstance(self._mt5_cost_model, dict):
+                raise ValueError("explicit MT5 ForexEngine runs require a resolved cost_model")
+            self._configure_explicit_mt5_cost_model(self._mt5_cost_model)
+        else:
+            # Preserve non-MT5 callers' established default behavior.
+            self.spread_override = config.get("spread_pips_override")
+            self.slippage_pips: float = config.get("slippage_pips", 0.3)
+            self.commission_per_lot_per_side = 0.0
+            self.swap_enabled: bool = config.get("swap_enabled", True)
+            self._explicit_swap = None
         self._last_swap_dates: dict = {}  # per-symbol swap tracking
+
+    def _configure_explicit_mt5_cost_model(self, model: dict) -> None:
+        """Apply a parent-resolved MT5 model; never fall back to engine defaults."""
+        from backtest.mt5_cost_model import validate_resolved_cost_model
+
+        model = validate_resolved_cost_model(model)
+        spread = model["spread"]
+        slippage = model["slippage"]
+        commission = model["commission"]
+        swap = model["swap"]
+        self.spread_override = float(spread.get("value", 0.0)) if spread["enabled"] else 0.0
+        self.slippage_pips = float(slippage.get("value", 0.0)) if slippage["enabled"] else 0.0
+        self.commission_per_lot_per_side = (
+            float(commission.get("value", 0.0)) if commission["enabled"] else 0.0
+        )
+        self.swap_enabled = bool(swap["enabled"])
+        self._explicit_swap = swap if self.swap_enabled else None
 
     def can_execute(self, symbol: str, direction: int, bar: pd.Series) -> bool:
         """Forex: 24x5, no restrictions."""
@@ -124,14 +150,15 @@ class ForexEngine(BaseEngine):
         return max(int(raw_size / micro) * micro, 0.0)
 
     def calc_commission(self, size: float, price: float, _direction: int, is_open: bool) -> float:
-        """Forex: spread is the cost, embedded in slippage. No explicit commission.
+        """Apply explicit MT5 per-lot/per-side commission when configured.
 
-        Some ECN brokers charge per-lot commission; for simplicity, zero here.
-        The cost is captured via apply_slippage (half-spread applied to execution).
-        ``_direction`` is unused — reserved for future ECN per-lot fee
-        modelling (asymmetric long/short funding).
+        Legacy Forex callers retain their zero-commission behavior. Explicit
+        MT5 runs may supply a frozen ``currency_per_lot_per_side`` contract.
         """
-        return 0.0
+        if self.commission_per_lot_per_side == 0.0:
+            return 0.0
+        lots = size / _lot_units(_normalize_symbol(self._active_symbol), self.lot_size)
+        return lots * self.commission_per_lot_per_side
 
     def apply_slippage(self, price: float, direction: int) -> float:
         """Apply half-spread + slippage using _active_symbol for correct pip/spread."""
@@ -162,6 +189,21 @@ class ForexEngine(BaseEngine):
     def on_bar(self, symbol: str, bar: pd.Series, timestamp: pd.Timestamp) -> None:
         """Apply daily swap/rollover at end of trading day."""
         if not self.swap_enabled:
+            return
+        if self._explicit_swap is not None:
+            current_date = timestamp.date()
+            if self._last_swap_dates.get(symbol) == current_date:
+                return
+            self._last_swap_dates[symbol] = current_date
+            lots = self.positions.get(symbol)
+            if lots is None:
+                return
+            per_lot = (
+                float(self._explicit_swap["value_long"])
+                if lots.direction == 1 else float(self._explicit_swap["value_short"])
+            )
+            multiplier = 3.0 if timestamp.weekday() == 2 else 1.0
+            self.capital += (lots.size / _lot_units(_normalize_symbol(symbol), self.lot_size)) * per_lot * multiplier
             return
         swap = calc_forex_swap(
             symbol, timestamp, self.positions,
