@@ -109,7 +109,7 @@ agents:
       5. **Verdict** — state "edge plausible / edge not shown / unknown" only for the contract-resolved instrument. No false confidence.
 
       Use load_skill + quantlib (maxdrawdown, historical_var, bootstrap_sharpe). Only numbers from real artifacts.
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, read_dependency_artifact]
     skills: [volatility, quant-statistics]
     max_iterations: 80
     timeout_seconds: 3600
@@ -132,7 +132,7 @@ agents:
       6. **Honest conclusion** — YES/NO/UNKNOWN for the contract-resolved instrument; no marketing.
 
       Do not invent numbers.
-    tools: [bash, read_file, write_file, load_skill]
+    tools: [bash, read_file, write_file, load_skill, read_dependency_artifact]
     skills: [report-generate]
     max_iterations: 60
     timeout_seconds: 3600
@@ -163,6 +163,12 @@ tasks:
     depends_on: [task-backtest]
     input_from:
       backtest_result: task-backtest
+    artifact_requirements:
+      - {producer_task_id: task-backtest, artifact_type: backtest.execution_provenance}
+      - {producer_task_id: task-backtest, artifact_type: backtest.config}
+      - {producer_task_id: task-backtest, artifact_type: backtest.metrics}
+      - {producer_task_id: task-backtest, artifact_type: backtest.equity}
+      - {producer_task_id: task-backtest, artifact_type: backtest.trades}
 
   - id: task-report
     agent_id: report_aggregator
@@ -173,6 +179,11 @@ tasks:
       factors: task-factor
       backtest_result: task-backtest
       risk_audit: task-risk
+    artifact_requirements:
+      - {producer_task_id: task-backtest, artifact_type: backtest.execution_provenance}
+      - {producer_task_id: task-backtest, artifact_type: backtest.config}
+      - {producer_task_id: task-backtest, artifact_type: backtest.metrics}
+      - {producer_task_id: task-risk, artifact_type: risk.audit_report}
 
 variables:
   - name: market

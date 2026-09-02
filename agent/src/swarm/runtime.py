@@ -54,9 +54,48 @@ from src.swarm.task_store import (
 from src.tools.mcp import invalidate_mcp_specs_cache
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import agent_artifact_dir, clear_agent_artifacts, run_worker
-from src.swarm.artifacts import register_task_artifacts
+from src.swarm.artifacts import register_task_artifacts, verify_registered_artifact
 
 logger = logging.getLogger(__name__)
+
+
+_STRICT_BACKTEST_ARTIFACTS = {
+    "execution_provenance.json": "backtest.execution_provenance",
+    "config.json": "backtest.config",
+    "metrics.csv": "backtest.metrics",
+    "equity.csv": "backtest.equity",
+    "trades.csv": "backtest.trades",
+    "run_card.json": "backtest.run_card",
+}
+
+
+def _classify_authoritative_artifacts(run: SwarmRun, task: SwarmTask, refs: list[ArtifactRef], run_dir: Path) -> list[ArtifactRef]:
+    """Classify strict quantitative evidence only from a verified producer bundle.
+
+    File names are merely candidates.  A strict backtester bundle becomes
+    authoritative only after its server-written provenance validates against
+    the active execution identity and owning Swarm run.
+    """
+    if run.preset_name != "quant_scalp_desk" or task.id != "task-backtest":
+        return refs
+    provenance = next((r for r in refs if Path(r.run_relative_path).name == "execution_provenance.json"), None)
+    payload = None
+    if provenance is not None:
+        try:
+            payload = json.loads((run_dir / provenance.run_relative_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+    validation = validate_execution_provenance(run.execution_identity, payload, owning_run_id=run.id)
+    if not validation.valid:
+        return refs
+    classified: list[ArtifactRef] = []
+    for ref in refs:
+        artifact_type = _STRICT_BACKTEST_ARTIFACTS.get(Path(ref.run_relative_path).name, "worker.file")
+        classified.append(ref.model_copy(update={
+            "artifact_type": artifact_type,
+            "provenance_status": "passed" if artifact_type.startswith("backtest.") else "unclassified",
+        }))
+    return classified
 
 
 def _worker_retry_delay_ceiling_s(retry_number: int) -> float:
@@ -550,6 +589,23 @@ class SwarmRuntime:
                             artifact_paths=result.artifact_paths,
                             execution_identity_hash=run.identity_hash,
                         )
+                        artifact_refs = _classify_authoritative_artifacts(run, task, artifact_refs, run_dir)
+                        if task.id == "task-risk" and task.artifact_requirements:
+                            consumed = []
+                            for requirement in task.artifact_requirements:
+                                producer = task_store.load_task(requirement.producer_task_id)
+                                consumed.extend(
+                                    ref.artifact_id for ref in producer.artifact_refs
+                                    if ref.artifact_type == requirement.artifact_type
+                                    and ref.provenance_status == "passed"
+                                    and ref.execution_identity_hash == run.identity_hash
+                                )
+                            if len(consumed) == len(task.artifact_requirements):
+                                artifact_refs = [ref.model_copy(update={
+                                    "artifact_type": "risk.audit_report" if Path(ref.run_relative_path).name == "report.md" else ref.artifact_type,
+                                    "provenance_status": "passed" if Path(ref.run_relative_path).name == "report.md" else ref.provenance_status,
+                                    "derived_from_artifact_ids": sorted(consumed) if Path(ref.run_relative_path).name == "report.md" else ref.derived_from_artifact_ids,
+                                }) for ref in artifact_refs]
                         task_store.update_status(
                             tid,
                             TaskStatus.completed,
@@ -1008,6 +1064,41 @@ class SwarmRuntime:
                             data={"blocked_by": blocked_by_ids, "reason": reason},
                         ),
                     )
+                    continue
+
+                # A declared quantitative dependency is satisfied only by a
+                # server-registered, provenance-valid ArtifactRef.  Prose
+                # summaries and same-named worker files never satisfy it.
+                missing_requirements: list[str] = []
+                for requirement in task.artifact_requirements:
+                    try:
+                        producer = task_store.load_task(requirement.producer_task_id)
+                    except FileNotFoundError:
+                        missing_requirements.append(f"{requirement.producer_task_id}/{requirement.artifact_type}")
+                        continue
+                    valid_ref = any(
+                        ref.producer_run_id == run.id
+                        and ref.producer_task_id == requirement.producer_task_id
+                        and ref.artifact_type == requirement.artifact_type
+                        and ref.provenance_status == "passed"
+                        and ref.execution_identity_hash == run.identity_hash
+                        and verify_registered_artifact(run_dir, ref)
+                        for ref in producer.artifact_refs
+                    )
+                    if requirement.required and not valid_ref:
+                        missing_requirements.append(f"{requirement.producer_task_id}/{requirement.artifact_type}")
+                if missing_requirements:
+                    task_store.update_status(
+                        tid, TaskStatus.blocked,
+                        error="missing_required_artifacts: " + ", ".join(missing_requirements),
+                        blocked_by=sorted({item.split("/", 1)[0] for item in missing_requirements}),
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    self._emit_event(run.id, self._make_event(
+                        "task_blocked", agent_id=task.agent_id, task_id=tid,
+                        data={"reason_code": "missing_required_artifacts", "missing": missing_requirements,
+                              "identity_hash": run.identity_hash, "run_id": run.id},
+                    ))
                     continue
 
                 agent_spec = agent_map.get(task.agent_id)

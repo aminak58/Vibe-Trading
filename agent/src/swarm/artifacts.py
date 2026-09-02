@@ -133,6 +133,19 @@ def register_task_artifacts(
     return refs
 
 
+def verify_registered_artifact(run_dir: Path, ref: ArtifactRef) -> bool:
+    """Return true only while a registered ref still names the same safe bytes."""
+    try:
+        relative = Path(ref.run_relative_path)
+        if relative.is_absolute() or ".." in relative.parts or _has_symlink_component(run_dir.resolve(), relative):
+            return False
+        path = (run_dir.resolve() / relative).resolve(strict=True)
+        root = _producer_artifact_dir(run_dir.resolve(), ref.producer_agent_id)
+        return path.is_file() and path.is_relative_to(root) and path.stat().st_size == ref.byte_size and _sha256_file(path) == ref.sha256
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 class ReadDependencyArtifactTool(BaseTool):
     """Read a server-authorized immutable artifact from a declared DAG edge.
 

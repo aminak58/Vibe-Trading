@@ -25,7 +25,7 @@ from string import Formatter
 import yaml
 
 from src.execution_identity import ExecutionIdentity, ExecutionMode, SourceMode
-from src.swarm.models import PresetCapabilities, RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, TaskStatus
+from src.swarm.models import ArtifactRequirement, PresetCapabilities, RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, TaskStatus
 from src.swarm.task_store import topological_layers, validate_dag
 
 PRESETS_DIR = Path(__file__).resolve().parent / "presets"
@@ -434,6 +434,7 @@ def build_run_from_preset(
             depends_on=depends_on,
             blocked_by=list(depends_on),
             input_from=task_data.get("input_from", {}),
+            artifact_requirements=[ArtifactRequirement.model_validate(item) for item in task_data.get("artifact_requirements", [])],
             status=status,
         ))
 

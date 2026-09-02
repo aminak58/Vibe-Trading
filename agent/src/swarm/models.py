@@ -230,6 +230,17 @@ class ArtifactRef(BaseModel):
     sha256: str
     byte_size: int
     execution_identity_hash: str | None = None
+    artifact_type: str = "worker.file"
+    provenance_status: str = "unclassified"
+    derived_from_artifact_ids: list[str] = Field(default_factory=list)
+
+
+class ArtifactRequirement(BaseModel):
+    """A server-validated artifact dependency declared by a preset task."""
+
+    producer_task_id: str
+    artifact_type: str
+    required: bool = True
 
 
 class SwarmTask(BaseModel):
@@ -265,6 +276,7 @@ class SwarmTask(BaseModel):
     summary: str | None = None
     artifacts: list[str] = Field(default_factory=list)
     artifact_refs: list[ArtifactRef] = Field(default_factory=list)
+    artifact_requirements: list[ArtifactRequirement] = Field(default_factory=list)
     error: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
