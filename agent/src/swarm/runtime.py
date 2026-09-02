@@ -54,7 +54,7 @@ from src.swarm.task_store import (
 from src.tools.mcp import invalidate_mcp_specs_cache
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import agent_artifact_dir, clear_agent_artifacts, run_worker
-from src.swarm.artifacts import register_task_artifacts, verify_registered_artifact
+from src.swarm.artifacts import current_artifact_manifest, finalize_artifact_generation, register_task_artifacts, verify_registered_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +590,8 @@ class SwarmRuntime:
                             execution_identity_hash=run.identity_hash,
                         )
                         artifact_refs = _classify_authoritative_artifacts(run, task, artifact_refs, run_dir)
+                        if artifact_refs:
+                            _, artifact_refs = finalize_artifact_generation(run_dir=run_dir, task_id=tid, identity_hash=run.identity_hash, refs=artifact_refs)
                         if task.id == "task-risk" and task.artifact_requirements:
                             consumed = []
                             for requirement in task.artifact_requirements:
@@ -601,10 +603,12 @@ class SwarmRuntime:
                                     and ref.execution_identity_hash == run.identity_hash
                                 )
                             if len(consumed) == len(task.artifact_requirements):
+                                source_manifest = current_artifact_manifest(run_dir, "task-backtest")
                                 artifact_refs = [ref.model_copy(update={
                                     "artifact_type": "risk.audit_report" if Path(ref.run_relative_path).name == "report.md" else ref.artifact_type,
                                     "provenance_status": "passed" if Path(ref.run_relative_path).name == "report.md" else ref.provenance_status,
                                     "derived_from_artifact_ids": sorted(consumed) if Path(ref.run_relative_path).name == "report.md" else ref.derived_from_artifact_ids,
+                                    "derived_from_manifest_generation": (source_manifest.generation_id if source_manifest else None) if Path(ref.run_relative_path).name == "report.md" else ref.derived_from_manifest_generation,
                                 }) for ref in artifact_refs]
                         task_store.update_status(
                             tid,
@@ -1087,6 +1091,7 @@ class SwarmRuntime:
                     )
                     if valid_ref and requirement.artifact_type == "risk.audit_report":
                         backtester = task_store.load_task("task-backtest")
+                        manifest = current_artifact_manifest(run_dir, "task-backtest")
                         granted = {
                             ref.artifact_id for ref in backtester.artifact_refs
                             if ref.producer_run_id == run.id
@@ -1102,6 +1107,9 @@ class SwarmRuntime:
                             and ref.provenance_status == "passed"
                             and ref.execution_identity_hash == run.identity_hash
                             and set(ref.derived_from_artifact_ids).issubset(granted)
+                            and manifest is not None
+                            and ref.derived_from_manifest_generation == manifest.generation_id
+                            and set(ref.derived_from_artifact_ids).issubset(set(manifest.artifact_ids))
                             and bool(ref.derived_from_artifact_ids)
                             and verify_registered_artifact(run_dir, ref)
                             for ref in producer.artifact_refs

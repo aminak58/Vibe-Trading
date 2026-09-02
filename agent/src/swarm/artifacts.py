@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from pathlib import Path
 from typing import Mapping
 
-from src.swarm.models import ArtifactRef
+from src.swarm.models import ArtifactManifest, ArtifactRef
 from src.agent.tools import BaseTool
 
 
@@ -25,9 +26,9 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_id(task_id: str, relative_path: str) -> str:
+def _artifact_id(task_id: str, relative_path: str, *, run_id: str = "", attempt_id: str = "", generation_id: str = "") -> str:
     """Return a stable opaque ID for a producer/task path pair."""
-    seed = f"{task_id}\0{relative_path}".encode("utf-8")
+    seed = f"{run_id}\0{task_id}\0{attempt_id}\0{generation_id}\0{relative_path}".encode("utf-8")
     return "artifact-" + hashlib.sha256(seed).hexdigest()[:24]
 
 
@@ -69,6 +70,8 @@ def register_task_artifacts(
     agent_id: str,
     artifact_paths: list[str],
     execution_identity_hash: str | None,
+    producer_attempt_id: str | None = None,
+    manifest_generation_id: str | None = None,
 ) -> list[ArtifactRef]:
     """Validate and content-address a completed worker's artifact candidates.
 
@@ -116,7 +119,7 @@ def register_task_artifacts(
         try:
             refs.append(
                 ArtifactRef(
-                    artifact_id=_artifact_id(task_id, relative_path),
+                    artifact_id=_artifact_id(task_id, relative_path, run_id=run_root.name, attempt_id=producer_attempt_id or "legacy", generation_id=manifest_generation_id or "legacy"),
                     producer_run_id=run_root.name,
                     producer_task_id=task_id,
                     producer_agent_id=agent_id,
@@ -124,6 +127,8 @@ def register_task_artifacts(
                     sha256=_sha256_file(resolved),
                     byte_size=resolved.stat().st_size,
                     execution_identity_hash=execution_identity_hash,
+                    producer_attempt_id=producer_attempt_id,
+                    manifest_generation_id=manifest_generation_id,
                 )
             )
         except OSError:
@@ -131,6 +136,28 @@ def register_task_artifacts(
             # artifact.  A later reader must never receive a stale record.
             continue
     return refs
+
+
+def finalize_artifact_generation(*, run_dir: Path, task_id: str, identity_hash: str | None, refs: list[ArtifactRef]) -> tuple[ArtifactManifest, list[ArtifactRef]]:
+    """Atomically publish one validated producer generation as current."""
+    attempt_id = "attempt-" + uuid.uuid4().hex
+    generation_id = "generation-" + uuid.uuid4().hex
+    refreshed = [ref.model_copy(update={
+        "artifact_id": _artifact_id(task_id, ref.run_relative_path, run_id=run_dir.name, attempt_id=attempt_id, generation_id=generation_id),
+        "producer_attempt_id": attempt_id, "manifest_generation_id": generation_id,
+    }) for ref in refs]
+    manifest = ArtifactManifest(generation_id=generation_id, producer_attempt_id=attempt_id, producer_task_id=task_id, run_id=run_dir.name, identity_hash=identity_hash, artifact_ids=[r.artifact_id for r in refreshed])
+    root = run_dir / "artifact_manifests"; root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{task_id}.json"; tmp = path.with_suffix(".tmp")
+    tmp.write_text(manifest.model_dump_json(indent=2)+"\n", encoding="utf-8"); tmp.replace(path)
+    return manifest, refreshed
+
+
+def current_artifact_manifest(run_dir: Path, task_id: str) -> ArtifactManifest | None:
+    try:
+        return ArtifactManifest.model_validate_json((run_dir / "artifact_manifests" / f"{task_id}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def verify_registered_artifact(run_dir: Path, ref: ArtifactRef) -> bool:

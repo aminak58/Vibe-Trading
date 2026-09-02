@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from src.swarm.artifacts import register_task_artifacts
+from src.swarm.artifacts import finalize_artifact_generation, register_task_artifacts
 from src.swarm.models import RunStatus, SwarmAgentSpec, SwarmRun, SwarmTask, WorkerResult
 from src.swarm.runtime import SwarmRuntime
 from src.swarm.store import SwarmStore
@@ -70,6 +70,18 @@ def test_task_legacy_artifacts_round_trip_without_typed_refs() -> None:
     )
     assert task.artifact_refs == []
     assert SwarmTask.model_validate_json(task.model_dump_json()).artifacts == task.artifacts
+
+
+def test_same_path_in_two_generations_has_distinct_authoritative_ids(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    path = _write_worker_artifact(run_dir, "backtester", "metrics.csv", "one")
+    refs = register_task_artifacts(run_dir=run_dir, task_id="task-backtest", agent_id="backtester", artifact_paths=["artifacts/backtester/metrics.csv"], execution_identity_hash="ih")
+    g1, refs1 = finalize_artifact_generation(run_dir=run_dir, task_id="task-backtest", identity_hash="ih", refs=refs)
+    path.write_text("two", encoding="utf-8")
+    refs = register_task_artifacts(run_dir=run_dir, task_id="task-backtest", agent_id="backtester", artifact_paths=["artifacts/backtester/metrics.csv"], execution_identity_hash="ih")
+    g2, refs2 = finalize_artifact_generation(run_dir=run_dir, task_id="task-backtest", identity_hash="ih", refs=refs)
+    assert g1.generation_id != g2.generation_id
+    assert refs1[0].artifact_id != refs2[0].artifact_id
 
 
 def test_runtime_persists_refs_only_for_completed_task(tmp_path: Path) -> None:

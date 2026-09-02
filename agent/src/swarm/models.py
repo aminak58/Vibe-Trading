@@ -233,6 +233,22 @@ class ArtifactRef(BaseModel):
     artifact_type: str = "worker.file"
     provenance_status: str = "unclassified"
     derived_from_artifact_ids: list[str] = Field(default_factory=list)
+    producer_attempt_id: str | None = None
+    manifest_generation_id: str | None = None
+    derived_from_manifest_generation: str | None = None
+
+
+class ArtifactManifest(BaseModel):
+    """Server-owned finalized generation for one producer task."""
+
+    generation_id: str
+    producer_attempt_id: str
+    producer_task_id: str
+    run_id: str
+    identity_hash: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
+    finalized: bool = True
+    status: str = "succeeded"
 
 
 class ArtifactRequirement(BaseModel):
