@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -209,7 +210,7 @@ class WorkflowObligationLedger:
     def mark_swarm_started(self) -> None:
         """Record dispatch before a long-running Swarm tool returns."""
         if self._obligation.mode is WorkflowMode.SWARM_REQUIRED:
-            self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True)
+            self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True, launch_id="launch-" + uuid.uuid4().hex)
             self.persist()
 
     def bind_swarm_run(self, run_id: str) -> None:

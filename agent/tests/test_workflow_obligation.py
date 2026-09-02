@@ -200,6 +200,15 @@ def test_terminal_swarm_consumes_current_objective_attempt(tmp_path: Path, statu
     assert ledger.block("backtest", {}) is not None
 
 
+def test_launch_is_persisted_before_run_id_binding(tmp_path: Path) -> None:
+    ledger = WorkflowObligationLedger(run_dir=tmp_path, user_message="Run Swarm")
+    ledger.mark_swarm_started()
+    assert ledger.obligation.launch_id and ledger.obligation.swarm_run_id is None
+    # Cancellation before bind cannot name or cancel an unrelated run and the
+    # one-attempt gate remains fail-closed.
+    assert ledger.block("run_swarm", {}) is not None
+
+
 class _BacktestTool(BaseTool):
     name = "backtest"
     description = "Run a backtest."
