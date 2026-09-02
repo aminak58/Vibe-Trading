@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.agent.context import ContextBuilder
 from src.agent.grounding import GroundingLedger
 from src.agent.execution_identity_state import ExecutionIdentityLedger
+from src.agent.workflow_obligation import WorkflowObligationLedger
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
@@ -945,6 +946,7 @@ class AgentLoop:
         self._has_run = False
         self._grounding: GroundingLedger | None = None
         self._execution_identity: ExecutionIdentityLedger | None = None
+        self._workflow_obligation: WorkflowObligationLedger | None = None
         self._released_fallback = False
         self._released_fallback_reason: str | None = None
         self._written_files: set[str] = set()
@@ -1146,6 +1148,12 @@ class AgentLoop:
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
         self._execution_identity = ExecutionIdentityLedger(
+            run_dir=run_dir,
+            user_message=user_message,
+        )
+        # Only the raw current request enters this parser.  ContextBuilder,
+        # recalled memory, history, and model text never create obligations.
+        self._workflow_obligation = WorkflowObligationLedger(
             run_dir=run_dir,
             user_message=user_message,
         )
@@ -2031,6 +2039,18 @@ class AgentLoop:
                 execution_plan.append((tc, ownership_block))
                 continue
 
+            workflow_obligation = getattr(self, "_workflow_obligation", None)
+            if workflow_obligation is not None:
+                execution_identity = getattr(self, "_execution_identity", None)
+                if execution_identity is not None:
+                    identity = execution_identity.snapshot()
+                    if identity.status.value == "verified":
+                        workflow_obligation.bind_identity(identity.identity_hash)
+                obligation_block = workflow_obligation.block(tc.name, tc.arguments)
+                if obligation_block is not None:
+                    execution_plan.append((tc, obligation_block))
+                    continue
+
             if self._grounding is not None:
                 authorization = self._grounding.authorize_tool_call(
                     tc.name,
@@ -2360,6 +2380,10 @@ class AgentLoop:
         """
         readonly = self._is_tool_readonly(tool_name)
         invocation_args = dict(args)
+        if tool_name == "run_swarm":
+            workflow_obligation = getattr(self, "_workflow_obligation", None)
+            if workflow_obligation is not None:
+                workflow_obligation.mark_swarm_started()
         if tool_name in {"run_swarm", "backtest"} and self._execution_identity is not None:
             # This value is deliberately not part of the model-facing tool
             # schema. The server owns the current identity snapshot.
@@ -2681,8 +2705,14 @@ class AgentLoop:
 
         if tc.name == "run_swarm":
             self._record_swarm_ownership(result)
+            workflow_obligation = getattr(self, "_workflow_obligation", None)
+            if workflow_obligation is not None:
+                workflow_obligation.record_swarm_result(result)
         elif tc.name == "get_swarm_status":
             self._clear_completed_swarm_ownership(result)
+            workflow_obligation = getattr(self, "_workflow_obligation", None)
+            if workflow_obligation is not None:
+                workflow_obligation.record_status_result(result)
 
         # Cache successful deterministic results so an identical later call is
         # served without re-execution (regression: repeated financial_rigor
