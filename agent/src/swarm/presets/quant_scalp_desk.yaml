@@ -68,7 +68,7 @@ agents:
 
       ## Required outputs
       1. **Strategy logic** — explicit entry/exit/filter rules per timeframe (higher TF regime, lower TF entry)
-      2. **Strategy code** — write signal_engine.py + config.json per load_skill("strategy-generate") standards. The config must use exactly the contract's resolved symbol and source, an explicitly declared cost model, and a timeframe allowed by the task.
+      2. **Strategy code** — call `get_backtest_contract(source="mt5")` before writing signal_engine.py + config.json. Use its authoritative cost-model structure exactly; do not guess versions or defaults. The config must use exactly the contract's resolved symbol and source, an explicitly declared cost model, and a timeframe allowed by the task.
       3. **Backtest** — run the single contract-scoped configuration with the **backtest** tool. If the contract cannot be satisfied, return `identity_blocked` and do not create a replacement configuration.
       4. **Metrics** — report only metrics produced by that contract-scoped run.
       5. **Improvement ideas** — only based on results you actually got
@@ -87,7 +87,7 @@ agents:
       - If the engine still raises "insufficient capital for position rebalance": confirm `position_adjustment` is "hold", then rerun; do not fabricate numbers.
       - Do not model spread, slippage, commission, or swap implicitly in the signal layer; use only the explicit cost model.
       - Never invent Sharpe/DD/win-rate. Output real numbers from real outputs.
-    tools: [bash, read_file, write_file, edit_file, load_skill, backtest]
+    tools: [bash, read_file, write_file, edit_file, load_skill, get_backtest_contract, backtest]
     skills: [strategy-generate, technical-basic]
     max_iterations: 100
     timeout_seconds: 3600
