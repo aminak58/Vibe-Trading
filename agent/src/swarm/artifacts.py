@@ -9,10 +9,12 @@ read access; dependency-scoped transport is a later runtime concern.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
+from typing import Mapping
 
 from src.swarm.models import ArtifactRef
-from src.swarm.worker import agent_artifact_dir
+from src.agent.tools import BaseTool
 
 
 def _sha256_file(path: Path) -> str:
@@ -42,6 +44,24 @@ def _has_symlink_component(root: Path, relative: Path) -> bool:
     return False
 
 
+def _producer_artifact_dir(run_dir: Path, agent_id: str) -> Path:
+    """Resolve the one permissible artifact directory for an agent.
+
+    Kept here instead of importing ``worker.agent_artifact_dir`` so this
+    server-side module can also provide the private reader that workers load.
+    The worker's pre-existing helper remains the writer-side authority.
+    """
+    if not agent_id or agent_id in {".", ".."} or Path(agent_id).name != agent_id:
+        raise ValueError(f"Invalid swarm agent id {agent_id!r}")
+    run_root = run_dir.resolve()
+    artifact_root = (run_root / "artifacts").resolve()
+    candidate = artifact_root / agent_id
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(artifact_root) or resolved.parent != artifact_root:
+        raise ValueError(f"Invalid swarm agent id {agent_id!r}: artifact path escapes root")
+    return resolved
+
+
 def register_task_artifacts(
     *,
     run_dir: Path,
@@ -57,7 +77,7 @@ def register_task_artifacts(
     deterministic and all paths are normalized to POSIX run-relative form.
     """
     run_root = run_dir.resolve()
-    producer_root = agent_artifact_dir(run_dir, agent_id).resolve()
+    producer_root = _producer_artifact_dir(run_dir, agent_id)
     artifact_root = (run_root / "artifacts").resolve()
     if not producer_root.is_relative_to(artifact_root):
         raise ValueError("producer artifact directory escapes swarm artifact root")
@@ -97,6 +117,7 @@ def register_task_artifacts(
             refs.append(
                 ArtifactRef(
                     artifact_id=_artifact_id(task_id, relative_path),
+                    producer_run_id=run_root.name,
                     producer_task_id=task_id,
                     producer_agent_id=agent_id,
                     run_relative_path=relative_path,
@@ -110,3 +131,119 @@ def register_task_artifacts(
             # artifact.  A later reader must never receive a stale record.
             continue
     return refs
+
+
+class ReadDependencyArtifactTool(BaseTool):
+    """Read a server-authorized immutable artifact from a declared DAG edge.
+
+    This tool is constructed privately for an individual worker.  Its opaque
+    IDs come from the runtime's task ``input_from`` map; callers cannot pass a
+    filesystem path, producer task, or another run ID.
+    """
+
+    name = "read_dependency_artifact"
+    description = (
+        "Read one immutable artifact supplied by a declared upstream task. "
+        "Use an artifact_id from the Upstream Artifact Manifest; paths and "
+        "other workers' artifacts are not accepted."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "artifact_id": {
+                "type": "string",
+                "description": "Opaque artifact ID from the Upstream Artifact Manifest.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based line offset (default 0).",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5000,
+                "description": "Maximum text lines to return (default 500).",
+            },
+        },
+        "required": ["artifact_id"],
+        "additionalProperties": False,
+    }
+    repeatable = True
+    is_readonly = True
+
+    def __init__(
+        self,
+        *,
+        run_dir: Path,
+        allowed_refs: Mapping[str, ArtifactRef],
+        execution_identity_hash: str | None,
+    ) -> None:
+        self._run_dir = run_dir.resolve()
+        self._allowed_refs = dict(allowed_refs)
+        self._execution_identity_hash = execution_identity_hash
+
+    def _error(self, code: str, message: str) -> str:
+        return json.dumps({"status": "error", "error_code": code, "error": message}, ensure_ascii=False)
+
+    def _resolve_ref(self, ref: ArtifactRef) -> Path | None:
+        relative = Path(ref.run_relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        if _has_symlink_component(self._run_dir, relative):
+            return None
+        try:
+            path = (self._run_dir / relative).resolve(strict=True)
+            producer_root = _producer_artifact_dir(self._run_dir, ref.producer_agent_id)
+            if not path.is_relative_to(producer_root) or not path.is_file() or path.is_symlink():
+                return None
+            return path
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def execute(self, **kwargs: object) -> str:
+        artifact_id = kwargs.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return self._error("invalid_argument", "artifact_id must be a non-empty string")
+        ref = self._allowed_refs.get(artifact_id)
+        if ref is None:
+            return self._error("dependency_artifact_denied", "Artifact is not authorized for this task")
+        if ref.producer_run_id != self._run_dir.name:
+            return self._error("dependency_artifact_denied", "Artifact belongs to another swarm run")
+        if (
+            self._execution_identity_hash is not None
+            and ref.execution_identity_hash != self._execution_identity_hash
+        ):
+            return self._error("provenance_conflict", "Artifact identity hash does not match this execution")
+
+        offset = kwargs.get("offset", 0)
+        limit = kwargs.get("limit", 500)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return self._error("invalid_argument", "offset must be a non-negative integer")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5000:
+            return self._error("invalid_argument", "limit must be an integer from 1 through 5000")
+
+        path = self._resolve_ref(ref)
+        if path is None:
+            return self._error("dependency_artifact_invalid", "Authorized artifact path is missing or invalid")
+        try:
+            if path.stat().st_size != ref.byte_size or _sha256_file(path) != ref.sha256:
+                return self._error("provenance_conflict", "Artifact content no longer matches its registered hash")
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return self._error("unsupported_artifact", "Artifact is binary and cannot be read as text")
+        except OSError:
+            return self._error("dependency_artifact_invalid", "Authorized artifact could not be read")
+
+        lines = content.splitlines(keepends=True)
+        selected = "".join(lines[offset : offset + limit])
+        return json.dumps(
+            {
+                "status": "ok",
+                "artifact": ref.model_dump(),
+                "offset": offset,
+                "line_count": len(lines),
+                "content": selected,
+            },
+            ensure_ascii=False,
+        )

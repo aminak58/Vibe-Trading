@@ -49,6 +49,7 @@ def test_registration_content_addresses_only_producer_owned_regular_files(tmp_pa
 
     assert len(refs) == 1
     ref = refs[0]
+    assert ref.producer_run_id == "run"
     assert ref.producer_task_id == "task-backtest"
     assert ref.producer_agent_id == "backtester"
     assert ref.run_relative_path == "artifacts/backtester/metrics.csv"

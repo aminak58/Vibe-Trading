@@ -28,6 +28,7 @@ from src.config.schema import AgentConfig
 from src.providers.llm import _ensure_dotenv, uses_responses_api
 from src.swarm import grounding
 from src.swarm.models import (
+    ArtifactRef,
     RunStatus,
     SwarmAgentSpec,
     SwarmEvent,
@@ -1031,15 +1032,26 @@ class SwarmRuntime:
 
                 # Build upstream summaries from input_from mapping
                 upstream: dict[str, str] = {}
+                upstream_artifacts = {}
                 for context_key, source_task_id in task.input_from.items():
                     if source_task_id in task_summaries:
                         upstream[context_key] = task_summaries[source_task_id]
+                    try:
+                        source_task = task_store.load_task(source_task_id)
+                    except FileNotFoundError:
+                        source_task = None
+                    if source_task is not None and source_task.artifact_refs:
+                        # ``input_from`` is the sole edge declaration.  A
+                        # completed dependency that is not named here never
+                        # becomes visible to this worker.
+                        upstream_artifacts[context_key] = list(source_task.artifact_refs)
 
                 future = executor.submit(
                     self._run_worker_with_retries,
                     agent_spec=agent_spec,
                     task=task,
                     upstream_summaries=upstream,
+                    upstream_artifacts=upstream_artifacts,
                     user_vars=run.user_vars,
                     run_dir=run_dir,
                     event_callback=_event_callback,
@@ -1111,6 +1123,7 @@ class SwarmRuntime:
         grounding_block: str = "",
         cancel_event: threading.Event | None = None,
         execution_identity: ExecutionIdentity | None = None,
+        upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
     ) -> WorkerResult:
         """Run a worker with automatic retry on failure.
 
@@ -1189,6 +1202,7 @@ class SwarmRuntime:
                 agent_spec=agent_spec,
                 task=task,
                 upstream_summaries=upstream_summaries,
+                upstream_artifacts=upstream_artifacts,
                 user_vars=user_vars,
                 run_dir=run_dir,
                 event_callback=event_callback,

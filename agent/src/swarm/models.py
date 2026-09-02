@@ -223,6 +223,7 @@ class ArtifactRef(BaseModel):
     """
 
     artifact_id: str
+    producer_run_id: str
     producer_task_id: str
     producer_agent_id: str
     run_relative_path: str

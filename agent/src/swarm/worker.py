@@ -29,11 +29,13 @@ from src.providers.content_filter import (
     compute_content_filter_warnings,
 )
 from src.swarm.models import (
+    ArtifactRef,
     SwarmAgentSpec,
     SwarmEvent,
     SwarmTask,
     WorkerResult,
 )
+from src.swarm.artifacts import ReadDependencyArtifactTool
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
 from src.tools.redaction import is_sensitive_arg, redact_payload, redact_tool_result
@@ -227,12 +229,15 @@ def build_worker_prompt(
     skill_descriptions: str,
     grounding_block: str = "",
     execution_identity: ExecutionIdentity | None = None,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
 ) -> str:
     """Build the worker's system prompt with role, upstream context, and skills.
 
     Args:
         agent_spec: The agent's role specification.
         upstream_summaries: Mapping of context_key -> upstream task summary.
+        upstream_artifacts: Server-issued references from declared upstream
+            ``input_from`` tasks.  IDs, not filesystem paths, are rendered.
         skill_descriptions: Pre-filtered skill description text.
         grounding_block: Optional "Ground Truth" markdown produced by
             :func:`src.swarm.grounding.format_grounding_block`. Spliced in
@@ -255,6 +260,27 @@ def build_worker_prompt(
 
     if execution_identity is not None:
         prompt_parts.append(_render_execution_contract(execution_identity))
+
+    if upstream_artifacts:
+        manifest_sections: list[str] = []
+        for context_key in sorted(upstream_artifacts):
+            refs = upstream_artifacts[context_key]
+            if not refs:
+                continue
+            entries = "\n".join(
+                f"- artifact_id={ref.artifact_id}; producer={ref.producer_task_id}; "
+                f"file={Path(ref.run_relative_path).name}; bytes={ref.byte_size}; sha256={ref.sha256}"
+                for ref in refs
+            )
+            manifest_sections.append(f"### {context_key}\n{entries}")
+        if manifest_sections:
+            prompt_parts.append(
+                "## Upstream Artifact Manifest (SERVER-OWNED, READ-ONLY)\n\n"
+                "Only artifacts listed here were supplied by declared upstream tasks. "
+                "Use `read_dependency_artifact` with its artifact_id; do not "
+                "guess paths or read sibling workspaces.\n\n"
+                + "\n\n".join(manifest_sections)
+            )
 
     if skill_descriptions and skill_descriptions != "(no matching skills)":
         prompt_parts.append(
@@ -517,6 +543,7 @@ def run_worker(
     upstream_summaries: dict[str, str],
     user_vars: dict[str, str],
     run_dir: Path,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
     event_callback: Callable[[SwarmEvent], None] | None = None,
     include_shell_tools: bool = False,
     grounding_block: str = "",
@@ -565,6 +592,7 @@ def run_worker(
             agent_spec=agent_spec,
             task=task,
             upstream_summaries=upstream_summaries,
+            upstream_artifacts=upstream_artifacts,
             user_vars=user_vars,
             run_dir=run_dir,
             llm=llm,
@@ -585,6 +613,7 @@ def _run_worker_impl(
     upstream_summaries: dict[str, str],
     user_vars: dict[str, str],
     run_dir: Path,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
     event_callback: Callable[[SwarmEvent], None] | None = None,
     include_shell_tools: bool = False,
     grounding_block: str = "",
@@ -643,17 +672,30 @@ def _run_worker_impl(
     # 1. Build per-worker tool registry — local pool plus any operator-
     #    surfaced MCP tools, projected onto the agent's whitelist.
     registry = build_swarm_registry(
-        agent_spec.tools,
+        [name for name in agent_spec.tools if name != ReadDependencyArtifactTool.name],
         agent_config=agent_config,
         include_shell_tools=include_shell_tools,
     )
+    if ReadDependencyArtifactTool.name in agent_spec.tools:
+        allowed_refs = {
+            ref.artifact_id: ref
+            for refs in (upstream_artifacts or {}).values()
+            for ref in refs
+        }
+        registry.register(
+            ReadDependencyArtifactTool(
+                run_dir=run_dir,
+                allowed_refs=allowed_refs,
+                execution_identity_hash=(execution_identity.identity_hash if execution_identity else None),
+            )
+        )
 
     # 2. Build system prompt with filtered skills
     skills_loader = SkillsLoader()
     skill_desc = _filter_skill_descriptions(skills_loader, agent_spec.skills)
     system_prompt = build_worker_prompt(
         agent_spec, upstream_summaries, skill_desc, grounding_block=grounding_block,
-        execution_identity=execution_identity,
+        execution_identity=execution_identity, upstream_artifacts=upstream_artifacts,
     )
 
     # 4. Resolve prompt template with user vars (missing vars → LLM infers)
