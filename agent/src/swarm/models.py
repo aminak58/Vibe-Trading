@@ -373,6 +373,7 @@ class SwarmRun(BaseModel):
     execution_identity: ExecutionIdentity | None = None
     identity_hash: str | None = None
     owner_session_id: str | None = None
+    launch_id: str | None = None
     provenance_validation_status: str = "not_required"
     preset_capabilities: PresetCapabilities | None = None
 

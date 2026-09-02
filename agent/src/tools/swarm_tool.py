@@ -745,6 +745,7 @@ class SwarmTool(BaseTool):
         owner_session_id = kwargs.get("__owner_session_id")
         on_started = kwargs.get("__on_swarm_started")
         cancel_event = kwargs.get("__cancel_event")
+        launch_id = kwargs.get("__launch_id")
 
         if not prompt:
             return json.dumps(
@@ -833,6 +834,8 @@ class SwarmTool(BaseTool):
             if execution_identity is not None:
                 start_kwargs["execution_identity"] = execution_identity
                 start_kwargs["owner_session_id"] = owner_session_id
+            if isinstance(launch_id, str):
+                start_kwargs["launch_id"] = launch_id
             run = runtime.start_run(preset, variables, **start_kwargs)
         except FileNotFoundError as exc:
             return json.dumps(

@@ -338,6 +338,7 @@ class SwarmRuntime:
         resume_from: SwarmRun | None = None,
         execution_identity: ExecutionIdentity | None = None,
         owner_session_id: str | None = None,
+        launch_id: str | None = None,
     ) -> SwarmRun:
         """Start a swarm run. Returns immediately, execution happens in background.
 
@@ -376,6 +377,8 @@ class SwarmRuntime:
             execution_identity=execution_identity,
             owner_session_id=owner_session_id,
         )
+        if launch_id:
+            run = run.model_copy(update={"launch_id": launch_id})
         validate_dag(run.tasks)
 
         # Capture which provider/model the run was launched against so the

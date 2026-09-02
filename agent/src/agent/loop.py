@@ -2393,6 +2393,7 @@ class AgentLoop:
             if workflow_obligation is not None:
                 workflow_obligation.mark_swarm_started()
                 invocation_args["__on_swarm_started"] = workflow_obligation.bind_swarm_run
+                invocation_args["__launch_id"] = workflow_obligation.obligation.launch_id
             invocation_args["__cancel_event"] = self._cancel_event
         if tool_name in {"run_swarm", "backtest"} and self._execution_identity is not None:
             # This value is deliberately not part of the model-facing tool
