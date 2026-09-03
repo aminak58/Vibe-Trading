@@ -854,6 +854,9 @@ class SwarmTool(BaseTool):
             )
 
         run_id = run.id
+        _cancel_launch_correlated_run_if_requested(
+            runtime, store, run_id, launch_id, cancel_event
+        )
         if callable(on_started):
             on_started(run_id)
         run_id_holder["run_id"] = run_id
@@ -908,6 +911,23 @@ class SwarmTool(BaseTool):
             {"status": "timeout", "error": f"Swarm run {run_id} timed out after {max_wait}s"},
             ensure_ascii=False,
         )
+
+
+def _cancel_launch_correlated_run_if_requested(
+    runtime: Any, store: Any, run_id: str, launch_id: Any, cancel_event: Any
+) -> None:
+    """Cancel only a persisted run correlated to a pre-bind parent cancellation."""
+    if not getattr(cancel_event, "is_set", lambda: False)():
+        return
+    if not isinstance(launch_id, str) or not launch_id:
+        return
+    finder = getattr(store, "find_run_by_launch_id", None)
+    if not callable(finder):
+        return
+    correlated = finder(launch_id)
+    if correlated is None or getattr(correlated, "id", None) != run_id:
+        return
+    runtime.cancel_run(run_id)
 
 
 def _cancel_owned_run_if_requested(runtime: Any, run_id: str, cancel_event: Any) -> None:

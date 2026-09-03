@@ -879,3 +879,111 @@ def test_swarm_tool_without_session_callback_preserves_plain_runtime(monkeypatch
 
     assert payload["run_id"] == "r-no-session"
     assert payload["status"] == "running"
+
+
+def test_swarm_tool_reconciles_cancel_after_start_before_bind(monkeypatch, tmp_path):
+    """A parent cancel in the start→bind window targets only the launch-correlated run."""
+    import threading
+    import src.tools.swarm_tool as swarm_tool
+
+    cancel_event = threading.Event()
+    run = _base_run("r-launch-window")
+    run.status = RunStatus.running
+    run.launch_id = "launch-exact"
+    cancelled: list[str] = []
+    bound: list[str] = []
+
+    class FakeStore:
+        current = None
+
+        def __init__(self, base_dir):
+            self.base_dir = base_dir
+
+        def find_run_by_launch_id(self, launch_id):
+            candidate = type(self).current
+            return candidate if candidate is not None and candidate.launch_id == launch_id else None
+
+        def load_run(self, run_id):
+            return type(self).current if type(self).current and run_id == type(self).current.id else None
+
+        def reconcile_run(self, loaded, write=False):
+            return loaded
+
+    class FakeRuntime:
+        def __init__(self, store, max_workers=4, agent_config=None):
+            self._store = store
+
+        def start_run(self, preset, variables, **kwargs):
+            assert kwargs["launch_id"] == "launch-exact"
+            type(self._store).current = run
+            # Simulate UI cancellation after the run exists on disk but before
+            # SwarmTool has invoked the obligation's bind callback.
+            cancel_event.set()
+            return run
+
+        def cancel_run(self, run_id):
+            cancelled.append(run_id)
+            return True
+
+    monkeypatch.setattr(swarm_tool, "_MAX_WAIT_SECONDS", 0)
+    monkeypatch.setattr(swarm_tool, "_match_preset", lambda prompt: "demo")
+    monkeypatch.setattr(swarm_tool, "_build_variables", lambda preset, prompt: {"goal": prompt})
+    monkeypatch.setattr("src.config.load_swarm_agent_config", lambda: None)
+    monkeypatch.setattr("src.swarm.store.SwarmStore", FakeStore)
+    monkeypatch.setattr("src.swarm.runtime.SwarmRuntime", FakeRuntime)
+
+    payload = json.loads(swarm_tool.SwarmTool().execute(
+        prompt="analyze AAPL", __launch_id="launch-exact",
+        __cancel_event=cancel_event, __on_swarm_started=bound.append,
+    ))
+
+    assert bound == ["r-launch-window"]
+    assert cancelled == ["r-launch-window"]
+    assert payload["run_id"] == "r-launch-window"
+
+
+def test_prebind_cancel_never_targets_unmatched_launch(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    import src.tools.swarm_tool as swarm_tool
+
+    event = threading.Event(); event.set()
+    cancelled: list[str] = []
+    runtime = SimpleNamespace(cancel_run=lambda run_id: cancelled.append(run_id))
+
+    class WrongStore:
+        def find_run_by_launch_id(self, launch_id):
+            return SimpleNamespace(id="other-run", launch_id=launch_id)
+
+    swarm_tool._cancel_launch_correlated_run_if_requested(
+        runtime, WrongStore(), "expected-run", "launch-exact", event
+    )
+    assert cancelled == []
+
+    class MissingStore:
+        def find_run_by_launch_id(self, launch_id):
+            return None
+
+    swarm_tool._cancel_launch_correlated_run_if_requested(
+        runtime, MissingStore(), "expected-run", "launch-exact", event
+    )
+    assert cancelled == []
+
+
+def test_store_launch_lookup_is_unique_and_fail_closed(tmp_path):
+    store = SwarmStore(base_dir=tmp_path)
+    first = _base_run("r-launch-1")
+    first.launch_id = "launch-one"
+    store.create_run(first)
+    second = _base_run("r-launch-2")
+    second.launch_id = "launch-two"
+    store.create_run(second)
+
+    found = store.find_run_by_launch_id("launch-one")
+    assert found is not None and found.id == "r-launch-1"
+    assert store.find_run_by_launch_id("missing") is None
+
+    duplicate = _base_run("r-launch-3")
+    duplicate.launch_id = "launch-one"
+    store.create_run(duplicate)
+    assert store.find_run_by_launch_id("launch-one") is None

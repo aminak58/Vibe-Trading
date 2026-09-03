@@ -216,6 +216,11 @@ class SwarmStore:
             raise FileNotFoundError(f"Run directory not found: {rd.name}")
         self._atomic_write(rd / "run.json", run.model_dump_json(indent=2))
 
+    def find_run_by_launch_id(self, launch_id: str) -> SwarmRun | None:
+        """Return the unique persisted run carrying a server launch correlation."""
+        matches = [run for run in self.list_runs(limit=10000) if run.launch_id == launch_id]
+        return matches[0] if len(matches) == 1 else None
+
     def list_runs(self, limit: int = 50) -> list[SwarmRun]:
         """List all runs sorted by created_at descending.
 
