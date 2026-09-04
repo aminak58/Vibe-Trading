@@ -890,6 +890,7 @@ def test_swarm_tool_reconciles_cancel_after_start_before_bind(monkeypatch, tmp_p
     run = _base_run("r-launch-window")
     run.status = RunStatus.running
     run.launch_id = "launch-exact"
+    run.owner_session_id = "owner-session"
     cancelled: list[str] = []
     bound: list[str] = []
 
@@ -899,9 +900,9 @@ def test_swarm_tool_reconciles_cancel_after_start_before_bind(monkeypatch, tmp_p
         def __init__(self, base_dir):
             self.base_dir = base_dir
 
-        def find_run_by_launch_id(self, launch_id):
+        def find_run_by_launch_id(self, launch_id, *, owner_session_id=None):
             candidate = type(self).current
-            return candidate if candidate is not None and candidate.launch_id == launch_id else None
+            return candidate if candidate is not None and candidate.launch_id == launch_id and candidate.owner_session_id == owner_session_id else None
 
         def load_run(self, run_id):
             return type(self).current if type(self).current and run_id == type(self).current.id else None
@@ -915,6 +916,8 @@ def test_swarm_tool_reconciles_cancel_after_start_before_bind(monkeypatch, tmp_p
 
         def start_run(self, preset, variables, **kwargs):
             assert kwargs["launch_id"] == "launch-exact"
+            assert kwargs["owner_session_id"] == "owner-session"
+            assert kwargs["execution_identity"] is identity
             type(self._store).current = run
             # Simulate UI cancellation after the run exists on disk but before
             # SwarmTool has invoked the obligation's bind callback.
@@ -927,14 +930,16 @@ def test_swarm_tool_reconciles_cancel_after_start_before_bind(monkeypatch, tmp_p
 
     monkeypatch.setattr(swarm_tool, "_MAX_WAIT_SECONDS", 0)
     monkeypatch.setattr(swarm_tool, "_match_preset", lambda prompt: "demo")
-    monkeypatch.setattr(swarm_tool, "_build_variables", lambda preset, prompt: {"goal": prompt})
+    monkeypatch.setattr(swarm_tool, "_build_variables", lambda preset, prompt, **kwargs: {"goal": prompt})
     monkeypatch.setattr("src.config.load_swarm_agent_config", lambda: None)
     monkeypatch.setattr("src.swarm.store.SwarmStore", FakeStore)
     monkeypatch.setattr("src.swarm.runtime.SwarmRuntime", FakeRuntime)
 
+    identity = object()
     payload = json.loads(swarm_tool.SwarmTool().execute(
         prompt="analyze AAPL", __launch_id="launch-exact",
         __cancel_event=cancel_event, __on_swarm_started=bound.append,
+        __execution_identity=identity, __owner_session_id="owner-session",
     ))
 
     assert bound == ["r-launch-window"]
@@ -952,38 +957,81 @@ def test_prebind_cancel_never_targets_unmatched_launch(monkeypatch):
     runtime = SimpleNamespace(cancel_run=lambda run_id: cancelled.append(run_id))
 
     class WrongStore:
-        def find_run_by_launch_id(self, launch_id):
+        def find_run_by_launch_id(self, launch_id, *, owner_session_id=None):
             return SimpleNamespace(id="other-run", launch_id=launch_id)
 
     swarm_tool._cancel_launch_correlated_run_if_requested(
-        runtime, WrongStore(), "expected-run", "launch-exact", event
+        runtime, WrongStore(), "expected-run", "launch-exact", "owner-session", event
     )
     assert cancelled == []
 
     class MissingStore:
-        def find_run_by_launch_id(self, launch_id):
+        def find_run_by_launch_id(self, launch_id, *, owner_session_id=None):
             return None
 
     swarm_tool._cancel_launch_correlated_run_if_requested(
-        runtime, MissingStore(), "expected-run", "launch-exact", event
+        runtime, MissingStore(), "expected-run", "launch-exact", "owner-session", event
     )
     assert cancelled == []
 
 
-def test_store_launch_lookup_is_unique_and_fail_closed(tmp_path):
+def test_prebind_cancel_requires_matching_owner_session():
+    import threading
+    from types import SimpleNamespace
+    import src.tools.swarm_tool as swarm_tool
+
+    event = threading.Event(); event.set()
+    cancelled: list[str] = []
+    runtime = SimpleNamespace(cancel_run=lambda run_id: cancelled.append(run_id))
+
+    class WrongSessionStore:
+        def find_run_by_launch_id(self, launch_id, owner_session_id=None):
+            return SimpleNamespace(
+                id="expected-run",
+                launch_id=launch_id,
+                owner_session_id="other-session",
+            )
+
+    swarm_tool._cancel_launch_correlated_run_if_requested(
+        runtime, WrongSessionStore(), "expected-run", "launch-exact", "owner-session", event
+    )
+    assert cancelled == []
+
+    class MatchingSessionStore:
+        def find_run_by_launch_id(self, launch_id, owner_session_id=None):
+            return SimpleNamespace(
+                id="expected-run",
+                launch_id=launch_id,
+                owner_session_id=owner_session_id,
+            )
+
+    swarm_tool._cancel_launch_correlated_run_if_requested(
+        runtime, MatchingSessionStore(), "expected-run", "launch-exact", "owner-session", event
+    )
+    assert cancelled == ["expected-run"]
+
+
+def test_store_launch_lookup_is_unique_and_session_bound(tmp_path):
     store = SwarmStore(base_dir=tmp_path)
     first = _base_run("r-launch-1")
     first.launch_id = "launch-one"
+    first.owner_session_id = "session-one"
     store.create_run(first)
     second = _base_run("r-launch-2")
-    second.launch_id = "launch-two"
+    second.launch_id = "launch-one"
+    second.owner_session_id = "session-two"
     store.create_run(second)
 
-    found = store.find_run_by_launch_id("launch-one")
+    found = store.find_run_by_launch_id("launch-one", owner_session_id="session-one")
     assert found is not None and found.id == "r-launch-1"
-    assert store.find_run_by_launch_id("missing") is None
+    found = store.find_run_by_launch_id("launch-one", owner_session_id="session-two")
+    assert found is not None and found.id == "r-launch-2"
+    assert store.find_run_by_launch_id("launch-one", owner_session_id="wrong-session") is None
+    assert store.find_run_by_launch_id("launch-one") is None
+    assert store.find_run_by_launch_id("missing", owner_session_id="session-one") is None
 
     duplicate = _base_run("r-launch-3")
     duplicate.launch_id = "launch-one"
+    duplicate.owner_session_id = "session-one"
     store.create_run(duplicate)
-    assert store.find_run_by_launch_id("launch-one") is None
+    assert store.find_run_by_launch_id("launch-one", owner_session_id="session-one") is None

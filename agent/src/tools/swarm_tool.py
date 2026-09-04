@@ -743,6 +743,13 @@ class SwarmTool(BaseTool):
         prompt = kwargs.get("prompt", "")
         execution_identity = kwargs.get("__execution_identity")
         owner_session_id = kwargs.get("__owner_session_id")
+        trusted_owner_session_id = (
+            owner_session_id
+            if execution_identity is not None
+            and isinstance(owner_session_id, str)
+            and owner_session_id
+            else None
+        )
         on_started = kwargs.get("__on_swarm_started")
         cancel_event = kwargs.get("__cancel_event")
         launch_id = kwargs.get("__launch_id")
@@ -833,7 +840,7 @@ class SwarmTool(BaseTool):
             }
             if execution_identity is not None:
                 start_kwargs["execution_identity"] = execution_identity
-                start_kwargs["owner_session_id"] = owner_session_id
+                start_kwargs["owner_session_id"] = trusted_owner_session_id
             if isinstance(launch_id, str):
                 start_kwargs["launch_id"] = launch_id
             run = runtime.start_run(preset, variables, **start_kwargs)
@@ -855,7 +862,7 @@ class SwarmTool(BaseTool):
 
         run_id = run.id
         _cancel_launch_correlated_run_if_requested(
-            runtime, store, run_id, launch_id, cancel_event
+            runtime, store, run_id, launch_id, trusted_owner_session_id, cancel_event
         )
         if callable(on_started):
             on_started(run_id)
@@ -914,18 +921,33 @@ class SwarmTool(BaseTool):
 
 
 def _cancel_launch_correlated_run_if_requested(
-    runtime: Any, store: Any, run_id: str, launch_id: Any, cancel_event: Any
+    runtime: Any,
+    store: Any,
+    run_id: str,
+    launch_id: Any,
+    owner_session_id: Any,
+    cancel_event: Any,
 ) -> None:
     """Cancel only a persisted run correlated to a pre-bind parent cancellation."""
     if not getattr(cancel_event, "is_set", lambda: False)():
         return
-    if not isinstance(launch_id, str) or not launch_id:
+    if (
+        not isinstance(launch_id, str)
+        or not launch_id
+        or not isinstance(owner_session_id, str)
+        or not owner_session_id
+    ):
         return
     finder = getattr(store, "find_run_by_launch_id", None)
     if not callable(finder):
         return
-    correlated = finder(launch_id)
-    if correlated is None or getattr(correlated, "id", None) != run_id:
+    correlated = finder(launch_id, owner_session_id=owner_session_id)
+    if (
+        correlated is None
+        or getattr(correlated, "id", None) != run_id
+        or getattr(correlated, "launch_id", None) != launch_id
+        or getattr(correlated, "owner_session_id", None) != owner_session_id
+    ):
         return
     runtime.cancel_run(run_id)
 

@@ -962,6 +962,7 @@ class AgentLoop:
         self._called_identical: dict[tuple[str, str], str] = {}
         self._active_swarm_run_id: str | None = None
         self._active_swarm_identity_hash: str | None = None
+        self._trusted_owner_session_id: str | None = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1133,6 +1134,7 @@ class AgentLoop:
         self._called_identical = {}
         self._active_swarm_run_id = None
         self._active_swarm_identity_hash = None
+        self._trusted_owner_session_id = session_id if isinstance(session_id, str) and session_id else None
         run_started_wall = _time.time()
 
         state_store = RunStateStore()
@@ -2395,6 +2397,8 @@ class AgentLoop:
                 invocation_args["__on_swarm_started"] = workflow_obligation.bind_swarm_run
                 invocation_args["__launch_id"] = workflow_obligation.obligation.launch_id
             invocation_args["__cancel_event"] = self._cancel_event
+            if self._trusted_owner_session_id is not None:
+                invocation_args["__owner_session_id"] = self._trusted_owner_session_id
         if tool_name in {"run_swarm", "backtest"} and self._execution_identity is not None:
             # This value is deliberately not part of the model-facing tool
             # schema. The server owns the current identity snapshot.
