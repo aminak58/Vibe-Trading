@@ -1086,6 +1086,7 @@ class SwarmRuntime:
                     valid_ref = any(
                         ref.producer_run_id == run.id
                         and ref.producer_task_id == requirement.producer_task_id
+                        and ref.producer_agent_id == producer.agent_id
                         and ref.artifact_type == requirement.artifact_type
                         and ref.provenance_status == "passed"
                         and ref.execution_identity_hash == run.identity_hash
@@ -1099,6 +1100,7 @@ class SwarmRuntime:
                             ref.artifact_id for ref in backtester.artifact_refs
                             if ref.producer_run_id == run.id
                             and ref.producer_task_id == "task-backtest"
+                            and ref.producer_agent_id == backtester.agent_id
                             and ref.provenance_status == "passed"
                             and ref.execution_identity_hash == run.identity_hash
                             and verify_registered_artifact(run_dir, ref)
@@ -1106,6 +1108,7 @@ class SwarmRuntime:
                         valid_ref = any(
                             ref.producer_run_id == run.id
                             and ref.producer_task_id == requirement.producer_task_id
+                            and ref.producer_agent_id == producer.agent_id
                             and ref.artifact_type == "risk.audit_report"
                             and ref.provenance_status == "passed"
                             and ref.execution_identity_hash == run.identity_hash

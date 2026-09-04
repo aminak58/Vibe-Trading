@@ -95,7 +95,7 @@ def _dispatch(runtime, store, run, ts, monkeypatch):
     calls = []
     monkeypatch.setattr(
         rt, "run_worker",
-        lambda *a, **k: calls.append(a) or WorkerResult(status="completed", summary="ok"),
+        lambda *a, **k: calls.append(k) or WorkerResult(status="completed", summary="ok"),
     )
     runtime._execute_layer(
         run=run, task_store=ts,
@@ -184,6 +184,33 @@ def test_current_generation_exact_lineage_dispatches_report(tmp_path, monkeypatc
     calls, report = _dispatch(runtime, store, run, ts, monkeypatch)
     assert len(calls) == 1
 
+    assert calls[0]["task"].id == "task-report"
+    assert calls[0]["agent_spec"].id == "risk"
+
+
+def test_spoofed_producer_agent_artifact_blocks_report_before_dispatch(tmp_path, monkeypatch):
+    rd = tmp_path / "r"
+    rd.mkdir()
+    metric, risk = _base_refs(rd)
+    spoofed_metric = _write_ref(
+        rd,
+        artifact_id=metric.artifact_id,
+        task="task-backtest",
+        agent="spoofed-agent",
+        kind="backtest.metrics",
+        generation="G2",
+        path="artifacts/spoofed-agent/metrics.csv",
+        text="same-bytes",
+    )
+    _manifest(rd, "G2", [spoofed_metric.artifact_id])
+    store, runtime, run, ts = _case(tmp_path, [spoofed_metric], risk)
+
+    calls, report = _dispatch(runtime, store, run, ts, monkeypatch)
+
+    assert calls == []
+    assert report.status is TaskStatus.blocked
+    assert "task-backtest/backtest.metrics" in report.error
+
 
 def test_previous_run_or_wrong_producer_risk_report_rejected(tmp_path, monkeypatch):
     rd = tmp_path / "r"; rd.mkdir()
@@ -192,6 +219,7 @@ def test_previous_run_or_wrong_producer_risk_report_rejected(tmp_path, monkeypat
     for update in (
         {"producer_run_id": "previous-run"},
         {"producer_task_id": "task-other"},
+        {"producer_agent_id": "spoofed-agent"},
     ):
         bad = risk.model_copy(update=update)
         store, runtime, run, ts = _case(tmp_path, [metric], bad)
