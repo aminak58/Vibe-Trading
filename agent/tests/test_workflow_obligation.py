@@ -222,6 +222,59 @@ class _BacktestTool(BaseTool):
         return json.dumps({"status": "ok"})
 
 
+@pytest.mark.parametrize("payload", [
+    {"status": "error", "error_code": "denied_by_orchestration_intent"},
+    {"status": "failed", "run_id": None},
+    {"status": "completed", "run_id": "another-run"},
+])
+def test_unowned_results_preserve_bound_obligation(tmp_path, payload):
+    ledger = WorkflowObligationLedger(run_dir=tmp_path, user_message="Run Swarm")
+    ledger.mark_swarm_started()
+    ledger.bind_swarm_run("owned-run")
+    before = ledger.obligation.model_dump()
+    ledger.record_swarm_result(json.dumps(payload))
+    assert ledger.obligation.model_dump() == before
+    persisted = json.loads((tmp_path / "workflow_obligation.json").read_text())
+    assert persisted["swarm_run_id"] == "owned-run"
+
+
+def test_duplicate_mark_started_cannot_replace_launch(tmp_path):
+    ledger = WorkflowObligationLedger(run_dir=tmp_path, user_message="Run Swarm")
+    ledger.mark_swarm_started()
+    ledger.bind_swarm_run("owned-run")
+    before = ledger.obligation.model_dump()
+    ledger.mark_swarm_started()
+    assert ledger.obligation.model_dump() == before
+
+
+def test_loop_rejected_swarm_does_not_enter_ownership_mutation(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    registry = ToolRegistry()
+    agent = AgentLoop(registry=registry, llm=SimpleNamespace(), memory=WorkspaceMemory(run_dir=str(run_dir)))
+    ledger = WorkflowObligationLedger(run_dir=run_dir, user_message="Run Swarm")
+    ledger.mark_swarm_started()
+    ledger.bind_swarm_run("owned-run")
+    ledger.record_swarm_result(json.dumps({"status": "failed", "run_id": "owned-run"}))
+    agent._workflow_obligation = ledger
+    before = ledger.obligation.model_dump()
+    def forbidden_mutation(*args, **kwargs):
+        pytest.fail("Rejected invocation entered ownership mutation")
+    monkeypatch.setattr(ledger, "record_swarm_result", forbidden_mutation)
+    monkeypatch.setattr(agent, "_record_swarm_ownership", forbidden_mutation)
+    trace = TraceWriter(run_dir)
+    messages = []
+    try:
+        agent._process_tool_calls(
+            [SimpleNamespace(id="retry-denied", name="run_swarm", arguments={})],
+            ContextBuilder, messages, trace, [], 1,
+        )
+    finally:
+        trace.close()
+    assert any("denied_by_orchestration_intent" in m["content"] for m in messages)
+    assert ledger.obligation.model_dump() == before
+
+
 def test_loop_blocks_direct_backtest_before_tool_dispatch(tmp_path: Path) -> None:
     tool = _BacktestTool()
     registry = ToolRegistry()

@@ -2217,6 +2217,7 @@ class AgentLoop:
             react_trace,
             iteration,
             update_memory=False,
+            update_ownership=False,
         )
 
     def _batch_execute(
@@ -2657,6 +2658,7 @@ class AgentLoop:
         iteration: int,
         *,
         update_memory: bool = True,
+        update_ownership: bool = True,
     ) -> None:
         """Record a tool result: update memory, append message, write trace, emit event.
 
@@ -2718,12 +2720,12 @@ class AgentLoop:
             if self._grounding is not None:
                 self._grounding.set_execution_identity(self._execution_identity.snapshot())
 
-        if tc.name == "run_swarm":
+        if update_ownership and tc.name == "run_swarm":
             self._record_swarm_ownership(result)
             workflow_obligation = getattr(self, "_workflow_obligation", None)
             if workflow_obligation is not None:
                 workflow_obligation.record_swarm_result(result)
-        elif tc.name == "get_swarm_status":
+        elif update_ownership and tc.name == "get_swarm_status":
             self._clear_completed_swarm_ownership(result)
             workflow_obligation = getattr(self, "_workflow_obligation", None)
             if workflow_obligation is not None:

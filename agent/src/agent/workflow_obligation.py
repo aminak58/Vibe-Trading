@@ -187,8 +187,18 @@ class WorkflowObligationLedger:
         try:
             payload = json.loads(result)
         except (TypeError, ValueError):
+            if self._obligation.swarm_run_id:
+                return
             self._obligation = self._obligation.transition(WorkflowStatus.FAILED)
             self.persist()
+            return
+        # A denied invocation is not a result of the owning execution.
+        if isinstance(payload, dict) and payload.get("error_code") == "denied_by_orchestration_intent":
+            return
+        if self._obligation.swarm_run_id and (
+            not isinstance(payload, dict)
+            or payload.get("run_id") != self._obligation.swarm_run_id
+        ):
             return
         if not isinstance(payload, dict):
             self._obligation = self._obligation.transition(WorkflowStatus.FAILED)
@@ -209,7 +219,7 @@ class WorkflowObligationLedger:
 
     def mark_swarm_started(self) -> None:
         """Record dispatch before a long-running Swarm tool returns."""
-        if self._obligation.mode is WorkflowMode.SWARM_REQUIRED:
+        if self._obligation.mode is WorkflowMode.SWARM_REQUIRED and not self._obligation.dispatch_attempted:
             self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True, launch_id="launch-" + uuid.uuid4().hex)
             self.persist()
 
