@@ -55,6 +55,7 @@ def _case(tmp_path: Path, backtest_refs: list[ArtifactRef], risk_ref: ArtifactRe
     agents = [
         SwarmAgentSpec(id="backtester", role="b", system_prompt="x", max_retries=0),
         SwarmAgentSpec(id="risk", role="r", system_prompt="x", max_retries=0),
+        SwarmAgentSpec(id="report_aggregator", role="report", system_prompt="x", max_retries=0),
     ]
     backtest = SwarmTask(
         id="task-backtest", agent_id="backtester", prompt_template="x",
@@ -63,9 +64,10 @@ def _case(tmp_path: Path, backtest_refs: list[ArtifactRef], risk_ref: ArtifactRe
     risk = SwarmTask(
         id="task-risk", agent_id="risk", prompt_template="x",
         status=TaskStatus.completed, artifact_refs=[risk_ref],
+        input_from={"backtest": "task-backtest"},
     )
     report = SwarmTask(
-        id="task-report", agent_id="risk", prompt_template="x",
+        id="task-report", agent_id="report_aggregator", prompt_template="x",
         depends_on=["task-backtest", "task-risk"], blocked_by=[],
         input_from={"backtest": "task-backtest", "risk": "task-risk"},
         artifact_requirements=[
@@ -185,7 +187,46 @@ def test_current_generation_exact_lineage_dispatches_report(tmp_path, monkeypatc
     assert len(calls) == 1
 
     assert calls[0]["task"].id == "task-report"
-    assert calls[0]["agent_spec"].id == "risk"
+    assert calls[0]["agent_spec"].id == "report_aggregator"
+
+
+@pytest.mark.parametrize("update", [
+    {"producer_attempt_id": "wrong-attempt"},
+    {"manifest_generation_id": "G1"},
+])
+def test_current_artifact_id_with_wrong_attempt_or_generation_blocks_report(tmp_path, monkeypatch, update):
+    rd = tmp_path / "r"
+    rd.mkdir()
+    metric, risk = _base_refs(rd)
+    _manifest(rd, "G2", [metric.artifact_id])
+    store, runtime, run, ts = _case(tmp_path, [metric.model_copy(update=update)], risk)
+    calls, report = _dispatch(runtime, store, run, ts, monkeypatch)
+    assert calls == []
+    assert report.status is TaskStatus.blocked
+
+
+@pytest.mark.parametrize("update", [
+    {"run_id": "previous-run"},
+    {"identity_hash": "another-identity"},
+    {"producer_task_id": "another-producer"},
+    {"finalized": False},
+    {"status": "failed"},
+])
+def test_invalid_current_manifest_cannot_authorize_report(tmp_path, monkeypatch, update):
+    from src.swarm.artifacts import current_artifact_manifest
+
+    rd = tmp_path / "r"
+    rd.mkdir()
+    metric, risk = _base_refs(rd)
+    _manifest(rd, "G2", [metric.artifact_id])
+    manifest = current_artifact_manifest(rd, "task-backtest")
+    (rd / "artifact_manifests" / "task-backtest.json").write_text(
+        manifest.model_copy(update=update).model_dump_json(), encoding="utf-8"
+    )
+    store, runtime, run, ts = _case(tmp_path, [metric], risk)
+    calls, report = _dispatch(runtime, store, run, ts, monkeypatch)
+    assert calls == []
+    assert report.status is TaskStatus.blocked
 
 
 def test_spoofed_producer_agent_artifact_blocks_report_before_dispatch(tmp_path, monkeypatch):
@@ -239,6 +280,19 @@ def test_empty_lineage_rejected(tmp_path, monkeypatch):
     assert report.status is TaskStatus.blocked
 
 
+def test_backtest_artifacts_not_granted_to_risk_cannot_satisfy_lineage(tmp_path, monkeypatch):
+    rd = tmp_path / "r"
+    rd.mkdir()
+    metric, risk = _base_refs(rd)
+    _manifest(rd, "G2", [metric.artifact_id])
+    store, runtime, run, ts = _case(tmp_path, [metric], risk)
+    risk_task = ts.load_task("task-risk")
+    ts.save_task(risk_task.model_copy(update={"input_from": {}, "depends_on": ["task-backtest"]}))
+    calls, report = _dispatch(runtime, store, run, ts, monkeypatch)
+    assert calls == []
+    assert report.status is TaskStatus.blocked
+
+
 def test_unfinalized_failed_attempt_does_not_replace_current_manifest(tmp_path):
     from src.swarm.artifacts import current_artifact_manifest
 
@@ -258,3 +312,48 @@ def test_unfinalized_failed_attempt_does_not_replace_current_manifest(tmp_path):
     after = current_artifact_manifest(rd, "task-backtest")
     assert after is not None and after.generation_id == "G1"
     assert after.artifact_ids == [g1.artifact_id]
+
+
+def test_failed_worker_attempt_preserves_successful_generation_in_runtime(tmp_path, monkeypatch):
+    from src.swarm.artifacts import (
+        current_artifact_manifest, finalize_artifact_generation, register_task_artifacts,
+    )
+
+    store = SwarmStore(base_dir=tmp_path)
+    task = SwarmTask(id="task-backtest", agent_id="backtester", prompt_template="x")
+    agent = SwarmAgentSpec(id="backtester", role="backtest", system_prompt="x", max_retries=0)
+    run = SwarmRun(
+        id="r", preset_name="quant_scalp_desk", identity_hash="ih",
+        created_at=datetime.now(timezone.utc).isoformat(), agents=[agent], tasks=[task],
+    )
+    rd = store.create_run(run)
+    path = rd / "artifacts" / "backtester" / "metrics.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("first successful bytes", encoding="utf-8")
+    refs = register_task_artifacts(
+        run_dir=rd, task_id=task.id, agent_id=agent.id,
+        artifact_paths=["artifacts/backtester/metrics.csv"], execution_identity_hash="ih",
+    )
+    assert len(refs) == 1
+    g1, _ = finalize_artifact_generation(run_dir=rd, task_id=task.id, identity_hash="ih", refs=refs)
+    before = (rd / "artifact_manifests" / "task-backtest.json").read_bytes()
+    calls = []
+
+    def failed_worker(**kwargs):
+        calls.append(kwargs["task"].id)
+        path.write_text("failed candidate bytes", encoding="utf-8")
+        return WorkerResult(
+            status="failed", summary="candidate failed",
+            error="controlled producer failure", artifact_paths=["artifacts/backtester/metrics.csv"],
+        )
+
+    runtime = rt.SwarmRuntime(store=store)
+    monkeypatch.setattr(runtime, "_prefetch_grounding_data", lambda run: None)
+    monkeypatch.setattr(rt, "run_worker", failed_worker)
+    runtime._execute_run(run, threading.Event())
+
+    assert calls == ["task-backtest"]
+    assert store.load_run("r").status is RunStatus.failed
+    assert TaskStore(rd).load_task(task.id).status is TaskStatus.failed
+    assert current_artifact_manifest(rd, task.id).generation_id == g1.generation_id
+    assert (rd / "artifact_manifests" / "task-backtest.json").read_bytes() == before

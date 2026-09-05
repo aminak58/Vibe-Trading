@@ -1101,6 +1101,16 @@ class SwarmRuntime:
                             if ref.producer_run_id == run.id
                             and ref.producer_task_id == "task-backtest"
                             and ref.producer_agent_id == backtester.agent_id
+                            and backtester.id in producer.input_from.values()
+                            and manifest is not None
+                            and manifest.finalized
+                            and manifest.status == "succeeded"
+                            and manifest.run_id == run.id
+                            and manifest.producer_task_id == backtester.id
+                            and manifest.identity_hash == run.identity_hash
+                            and ref.manifest_generation_id == manifest.generation_id
+                            and ref.producer_attempt_id == manifest.producer_attempt_id
+                            and ref.artifact_id in manifest.artifact_ids
                             and ref.provenance_status == "passed"
                             and ref.execution_identity_hash == run.identity_hash
                             and verify_registered_artifact(run_dir, ref)
