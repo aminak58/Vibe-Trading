@@ -740,7 +740,8 @@ class SwarmRuntime:
             run.provenance_validation_status = provenance.status
             if not provenance.valid:
                 all_succeeded = False
-                run.status = RunStatus.failed
+                if not cancel_event.is_set():
+                    run.status = RunStatus.failed
                 run.final_report = (
                     "PROVENANCE_CONFLICT: strict execution provenance did not match "
                     "the server-owned Execution Contract (" + "; ".join(provenance.issues) + ")."
