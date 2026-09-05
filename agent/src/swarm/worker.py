@@ -38,9 +38,47 @@ from src.swarm.models import (
 from src.swarm.artifacts import ReadDependencyArtifactTool
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
+from src.tools.path_utils import safe_path
 from src.tools.redaction import is_sensitive_arg, redact_payload, redact_tool_result
 
 logger = logging.getLogger(__name__)
+
+_WORKER_FILE_TOOLS = {"write_file", "edit_file"}
+_WRITE_FILE_PATH_KEYS = ("path", "file_path", "filepath", "filename", "file")
+
+
+def _bind_worker_file_path(
+    tool_name: str, arguments: dict[str, Any], artifact_dir: Path
+) -> str | None:
+    """Bind worker write/edit paths to the owning artifact directory.
+
+    File tools retain their broader standalone fallback behavior. A Swarm
+    worker owns only ``artifact_dir``; validating here prevents a model path
+    from reaching that fallback. On success the selected write-file alias is
+    replaced with the canonical path used by the real file tool.
+    """
+    if tool_name not in _WORKER_FILE_TOOLS:
+        return None
+
+    if tool_name == "write_file":
+        file_path = next(
+            (arguments.get(key) for key in _WRITE_FILE_PATH_KEYS if arguments.get(key)),
+            None,
+        )
+    else:
+        file_path = arguments.get("path")
+
+    if not isinstance(file_path, str) or not file_path.strip():
+        return json.dumps(
+            {"status": "error", "error": "invalid file path: expected a non-empty string"},
+            ensure_ascii=False,
+        )
+
+    try:
+        arguments["path"] = str(safe_path(file_path, artifact_dir))
+    except (OSError, RuntimeError, ValueError) as exc:
+        return json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False)
+    return None
 
 def _default_max_iterations() -> int:
     from src.config.accessor import get_env_config
@@ -1104,6 +1142,8 @@ def _run_worker_impl(
                 })
                 continue
 
+            file_path_error = _bind_worker_file_path(tc.name, args, artifact_dir)
+
             # Wrap tool execution in a heartbeat so the events.jsonl tail has a
             # fresh timestamp every few seconds. The stale-run reaper relies on
             # this signal to tell a hung tool call apart from a dead host; the
@@ -1117,12 +1157,15 @@ def _run_worker_impl(
                     {**payload, "iteration": iteration, "phase": "tool"},
                 )
 
-            with HeartbeatTimer(
-                tool_name=tc.name,
-                interval=_HEARTBEAT_INTERVAL_S,
-                emit=_on_heartbeat,
-            ):
-                result = registry.execute(tc.name, args)
+            if file_path_error is not None:
+                result = file_path_error
+            else:
+                with HeartbeatTimer(
+                    tool_name=tc.name,
+                    interval=_HEARTBEAT_INTERVAL_S,
+                    emit=_on_heartbeat,
+                ):
+                    result = registry.execute(tc.name, args)
             result_is_error = _is_error_result(result)
             if tc.name != "load_skill" and not result_is_error:
                 data_tool_calls += 1
