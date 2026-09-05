@@ -113,6 +113,9 @@ def run_backtest(
     except json.JSONDecodeError as e:
         return json.dumps({"status": "error", "error": f"config.json parse error: {e}"}, ensure_ascii=False)
 
+    if not isinstance(config, dict):
+        return json.dumps({"status": "error", "error": "config.json must contain an object"}, ensure_ascii=False)
+
     if "source" not in config:
         return json.dumps({"status": "error", "error": "config.json missing 'source' field (tushare/okx/yfinance)"}, ensure_ascii=False)
 
@@ -125,6 +128,12 @@ def run_backtest(
 
     if config["source"] not in VALID_SOURCES:
         return json.dumps({"status": "error", "error": f"source must be one of {VALID_SOURCES}, got: {config['source']}"}, ensure_ascii=False)
+
+    # Package preflight is structural only. Never import generated strategy
+    # code in the trusted parent, and do not freeze data for a missing package.
+    signal_path = run_path / "code" / "signal_engine.py"
+    if not signal_path.is_file():
+        return json.dumps({"status": "error", "error": "code/signal_engine.py not found or not a regular file"}, ensure_ascii=False)
 
     # MT5's terminal IPC is process/environment-sensitive. Acquire broker bars
     # before crossing into the generated-strategy sandbox, then make the child
@@ -164,10 +173,6 @@ def run_backtest(
                 },
                 ensure_ascii=False,
             )
-
-    signal_path = run_path / "code" / "signal_engine.py"
-    if not signal_path.exists():
-        return json.dumps({"status": "error", "error": "code/signal_engine.py not found"}, ensure_ascii=False)
 
     agent_root = Path(__file__).resolve().parents[2]
     entry_script = agent_root / "backtest" / "runner.py"
