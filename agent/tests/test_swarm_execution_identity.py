@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from src.execution_identity import (
@@ -13,10 +15,12 @@ from src.execution_identity import (
     ExecutionResolution,
     FallbackPolicy,
     SourceMode,
+    SyntheticDataPolicy,
 )
 from src.swarm.presets import build_run_from_preset
+from src.swarm.artifacts import register_task_artifacts, verify_registered_artifact
 from src.swarm.worker import _validate_worker_execution_identity, build_worker_prompt
-from src.swarm.models import SwarmAgentSpec
+from src.swarm.models import ArtifactRef, SwarmAgentSpec
 from src.tools.swarm_tool import SwarmTool, _build_variables
 
 
@@ -29,6 +33,7 @@ def _verified_mt5_identity() -> ExecutionIdentity:
             source_mode=SourceMode.STRICT,
             fallback=FallbackPolicy.DENY,
             cross_source_fallback=False,
+            synthetic=SyntheticDataPolicy.FORBID,
         ),
         requests=(ExecutionRequest(request_id="gold", symbol="XAUUSD", source="mt5"),),
         resolutions=(
@@ -131,3 +136,102 @@ def test_public_swarm_schema_cannot_issue_authoritative_identity() -> None:
         preset_name="quant_scalp_desk",
     )
     assert "trusted server-side execution identity" in response
+
+
+def _market_data_ref(run_dir: Path, *, identity_hash: str, text: str = "date,XAUUSD_o\n2026-01-01,1\n") -> ArtifactRef:
+    path = run_dir / "artifacts" / "market_loader" / "prices.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    [ref] = register_task_artifacts(
+        run_dir=run_dir,
+        task_id="task-market-data",
+        agent_id="market_loader",
+        artifact_paths=[path.relative_to(run_dir).as_posix()],
+        execution_identity_hash=identity_hash,
+    )
+    return ref.model_copy(update={
+        "artifact_type": "market_data.snapshot",
+        "provenance_status": "passed",
+    })
+
+
+def test_strict_factor_analysis_rejects_raw_csv_without_registered_ref(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    raw = tmp_path / "synthetic.csv"
+    raw.write_text("date,XAUUSD_o\n2026-01-01,1\n", encoding="utf-8")
+
+    blocked = _validate_worker_execution_identity(
+        identity,
+        "factor_analysis",
+        {"factor_csv": str(raw), "return_csv": str(raw), "output_dir": str(tmp_path / "out")},
+        run_dir=tmp_path,
+        upstream_artifacts={},
+    )
+
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"
+
+
+def test_strict_factor_analysis_accepts_verified_same_run_market_data_refs(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    ref = _market_data_ref(tmp_path, identity_hash=identity.identity_hash)
+    path = tmp_path / ref.run_relative_path
+    assert verify_registered_artifact(tmp_path, ref)
+
+    allowed = _validate_worker_execution_identity(
+        identity,
+        "factor_analysis",
+        {"factor_csv": str(path), "return_csv": str(path), "output_dir": str(tmp_path / "out")},
+        run_dir=tmp_path,
+        upstream_artifacts={"market_data": [ref]},
+    )
+
+    assert allowed is None
+
+
+def test_strict_factor_analysis_rejects_tampered_registered_artifact(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    ref = _market_data_ref(tmp_path, identity_hash=identity.identity_hash)
+    path = tmp_path / ref.run_relative_path
+    path.write_text("tampered", encoding="utf-8")
+
+    blocked = _validate_worker_execution_identity(
+        identity,
+        "factor_analysis",
+        {"factor_csv": str(path), "return_csv": str(path), "output_dir": str(tmp_path / "out")},
+        run_dir=tmp_path,
+        upstream_artifacts={"market_data": [ref]},
+    )
+
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"
+
+
+def test_strict_factor_analysis_rejects_identity_mismatched_artifact(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    ref = _market_data_ref(tmp_path, identity_hash="other-source-identity")
+    path = tmp_path / ref.run_relative_path
+
+    blocked = _validate_worker_execution_identity(
+        identity,
+        "factor_analysis",
+        {"factor_csv": str(path), "return_csv": str(path), "output_dir": str(tmp_path / "out")},
+        run_dir=tmp_path,
+        upstream_artifacts={"market_data": [ref]},
+    )
+
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"
+
+
+def test_non_strict_factor_analysis_keeps_raw_csv_compatibility(tmp_path: Path) -> None:
+    raw = tmp_path / "standalone.csv"
+    raw.write_text("date,XAUUSD_o\n2026-01-01,1\n", encoding="utf-8")
+
+    assert _validate_worker_execution_identity(
+        None,
+        "factor_analysis",
+        {"factor_csv": str(raw), "return_csv": str(raw), "output_dir": str(tmp_path / "out")},
+        run_dir=tmp_path,
+        upstream_artifacts={},
+    ) is None

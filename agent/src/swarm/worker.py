@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.agent.context import ContextBuilder
-from src.execution_identity import ExecutionIdentity, ExecutionIdentityStatus, ExecutionMode, SourceMode
+from src.execution_identity import (
+    ExecutionIdentity,
+    ExecutionIdentityStatus,
+    ExecutionMode,
+    SourceMode,
+    SyntheticDataPolicy,
+)
 from src.agent.progress import HeartbeatTimer
 from src.agent.skills import SkillsLoader
 from src.agent.tools import ToolRegistry
@@ -35,7 +41,7 @@ from src.swarm.models import (
     SwarmTask,
     WorkerResult,
 )
-from src.swarm.artifacts import ReadDependencyArtifactTool
+from src.swarm.artifacts import ReadDependencyArtifactTool, verify_registered_artifact
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
 from src.tools.path_utils import safe_path
@@ -474,6 +480,9 @@ def _validate_worker_execution_identity(
     identity: ExecutionIdentity | None,
     tool_name: str,
     arguments: dict[str, Any],
+    *,
+    run_dir: Path | None = None,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
 ) -> dict[str, Any] | None:
     """Reject identity-sensitive worker calls that violate strict execution."""
     if (
@@ -484,6 +493,48 @@ def _validate_worker_execution_identity(
         return None
     if identity.status is not ExecutionIdentityStatus.VERIFIED or not identity.requests:
         return {"status": "error", "error_code": "identity_blocked", "message": "Strict execution identity is not verified."}
+    if tool_name == "factor_analysis":
+        if identity.policy.synthetic is not SyntheticDataPolicy.FORBID:
+            return None
+        if run_dir is None:
+            return {
+                "status": "error",
+                "error_code": "identity_blocked",
+                "message": "Strict factor analysis requires a server-owned artifact scope.",
+            }
+        allowed_refs = [
+            ref for refs in (upstream_artifacts or {}).values() for ref in refs
+        ]
+        for argument_name in ("factor_csv", "return_csv"):
+            raw_path = arguments.get(argument_name)
+            try:
+                requested_path = Path(str(raw_path)).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                requested_path = None
+            admitted = False
+            for ref in allowed_refs:
+                if (
+                    ref.producer_run_id != run_dir.name
+                    or ref.execution_identity_hash != identity.identity_hash
+                    or ref.provenance_status != "passed"
+                    or not ref.artifact_type.startswith("market_data.")
+                    or not verify_registered_artifact(run_dir, ref)
+                ):
+                    continue
+                try:
+                    if requested_path == (run_dir / ref.run_relative_path).resolve(strict=True):
+                        admitted = True
+                        break
+                except (OSError, RuntimeError, ValueError):
+                    continue
+            if not admitted:
+                return {
+                    "status": "error",
+                    "error_code": "identity_blocked",
+                    "message": "Strict factor analysis requires verified upstream market-data artifacts.",
+                    "argument": argument_name,
+                }
+        return None
     if tool_name not in {"get_market_data", "backtest"}:
         return None
     request = identity.requests[0]
@@ -1132,7 +1183,13 @@ def _run_worker_impl(
                 # boundary before a child process can execute it.
                 args["__execution_identity"] = execution_identity
                 args["__swarm_run_id"] = run_dir.name
-            identity_error = _validate_worker_execution_identity(execution_identity, tc.name, args)
+            identity_error = _validate_worker_execution_identity(
+                execution_identity,
+                tc.name,
+                args,
+                run_dir=run_dir,
+                upstream_artifacts=upstream_artifacts,
+            )
             if identity_error is not None:
                 result = json.dumps(identity_error, ensure_ascii=False)
                 messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
