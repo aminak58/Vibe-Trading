@@ -17,6 +17,7 @@ from src.execution_identity import (
     ExecutionRequest,
     ExecutionResolution,
     FallbackPolicy,
+    IdentityConflict,
     IdentityProvenance,
     ProvenanceAuthority,
     SourceMode,
@@ -107,57 +108,149 @@ class ExecutionIdentityLedger:
         if self._identity.mode is not ExecutionMode.SOURCE_SCOPED:
             return
         if not success:
-            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
-            self.persist()
+            self._reject_unresolved_identity()
             return
         try:
             payload = json.loads(result)
         except (TypeError, ValueError):
-            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
-            self.persist()
+            self._reject_unresolved_identity()
             return
         data = payload.get("data") if isinstance(payload, Mapping) else None
         candidates = data.get("candidates") if isinstance(data, Mapping) else None
         if not isinstance(candidates, list) or len(candidates) != 1 or not self._identity.requests:
-            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
-            self.persist()
+            self._reject_unresolved_identity()
             return
         candidate = candidates[0] if isinstance(candidates[0], Mapping) else {}
         request = self._identity.requests[0]
+        existing = next((item for item in self._identity.resolutions if item.request_id == request.request_id), None)
         source = str(candidate.get("source") or arguments.get("source") or "").casefold() or None
         requested = str(candidate.get("requested_symbol") or candidate.get("symbol") or "").upper() or None
         if request.source and source != request.source.casefold():
-            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
-            self.persist()
+            self._reject_or_record_conflict(
+                existing=existing,
+                field="source",
+                existing_value=request.source,
+                incoming_value=source,
+                call_id=call_id,
+                message="resolver source conflicts with the source-scoped request",
+            )
             return
         if request.symbol and requested != request.symbol.upper():
+            self._reject_or_record_conflict(
+                existing=existing,
+                field="requested_symbol",
+                existing_value=request.symbol,
+                incoming_value=requested,
+                call_id=call_id,
+                message="resolver requested symbol conflicts with the source-scoped request",
+            )
+            return
+        incoming = ExecutionResolution(
+            request_id=request.request_id,
+            canonical_asset=str(candidate.get("name") or "") or None,
+            # Preserve broker-native spelling in evidence; comparison-only
+            # boundaries normalize separately.
+            resolved_symbol=str(candidate.get("resolved_symbol") or "").strip() or None,
+            source=source,
+            broker=str(candidate.get("source_namespace") or "") or None,
+            venue=str(candidate.get("exchange") or "") or None,
+            asset_class=str(candidate.get("type") or "") or None,
+            market=str(candidate.get("market_type") or candidate.get("market") or "") or None,
+            resolver_evidence_ref=f"tool:search_symbol:{call_id}",
+            provenance=(
+                IdentityProvenance(
+                    authority=ProvenanceAuthority.SOURCE_RESOLVER,
+                    origin="search_symbol",
+                    evidence_ref=f"tool:search_symbol:{call_id}",
+                    confidence=1.0,
+                ),
+            ),
+        )
+        if existing is not None:
+            mismatch = next(
+                (
+                    (field, getattr(existing, field), getattr(incoming, field))
+                    for field in (
+                        "canonical_asset",
+                        "resolved_symbol",
+                        "source",
+                        "broker",
+                        "venue",
+                        "asset_class",
+                        "market",
+                    )
+                    if getattr(existing, field) != getattr(incoming, field)
+                ),
+                None,
+            )
+            if mismatch is None:
+                # A repeatable search_symbol confirmation has a different tool
+                # call ID but is not a new identity revision.
+                return
+            field, existing_value, incoming_value = mismatch
+            self._record_conflict(
+                field=field,
+                existing_value=existing_value,
+                incoming_value=incoming_value,
+                call_id=call_id,
+                message=f"resolver result conflicts with verified {field}",
+            )
+            return
+        self._identity = self._identity.with_resolution(incoming)
+        self.persist()
+
+    def _reject_unresolved_identity(self) -> None:
+        """Reject an unusable resolver result only before verification."""
+        if self._identity.resolutions:
+            return
+        self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+        self.persist()
+
+    def _reject_or_record_conflict(
+        self,
+        *,
+        existing: ExecutionResolution | None,
+        field: str,
+        existing_value: str | None,
+        incoming_value: str | None,
+        call_id: str,
+        message: str,
+    ) -> None:
+        if existing is None:
             self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
             self.persist()
             return
-        try:
-            self._identity = self._identity.with_resolution(
-                ExecutionResolution(
-                    request_id=request.request_id,
-                    canonical_asset=str(candidate.get("name") or "") or None,
-                    resolved_symbol=str(candidate.get("resolved_symbol") or "").upper() or None,
-                    source=source,
-                    broker=str(candidate.get("source_namespace") or "") or None,
-                    venue=str(candidate.get("exchange") or "") or None,
-                    asset_class=str(candidate.get("type") or "") or None,
-                    market=str(candidate.get("market_type") or candidate.get("market") or "") or None,
-                    resolver_evidence_ref=f"tool:search_symbol:{call_id}",
-                    provenance=(
-                        IdentityProvenance(
-                            authority=ProvenanceAuthority.SOURCE_RESOLVER,
-                            origin="search_symbol",
-                            evidence_ref=f"tool:search_symbol:{call_id}",
-                            confidence=1.0,
-                        ),
-                    ),
-                )
+        self._record_conflict(
+            field=field,
+            existing_value=existing_value,
+            incoming_value=incoming_value,
+            call_id=call_id,
+            message=message,
+        )
+
+    def _record_conflict(
+        self,
+        *,
+        field: str,
+        existing_value: str | None,
+        incoming_value: str | None,
+        call_id: str,
+        message: str,
+    ) -> None:
+        self._identity = self._identity.with_conflict(
+            IdentityConflict(
+                field=field,
+                existing_value=existing_value,
+                incoming_value=incoming_value,
+                provenance=IdentityProvenance(
+                    authority=ProvenanceAuthority.SOURCE_RESOLVER,
+                    origin="search_symbol",
+                    evidence_ref=f"tool:search_symbol:{call_id}",
+                    confidence=1.0,
+                ),
+                message=message,
             )
-        except ValueError:
-            self._identity = self._identity.with_status(ExecutionIdentityStatus.REJECTED)
+        )
         self.persist()
 
     def persist(self) -> None:

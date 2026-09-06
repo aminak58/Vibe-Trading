@@ -86,7 +86,7 @@ def test_mt5_identity_lock_authorizes_only_mt5_market_data(tmp_path: Path) -> No
 
     record = ledger.identity_summary()["records"][0]
     assert record["requested_symbol"] == "XAUUSD"
-    assert record["resolved_symbol"] == "XAUUSD_O"
+    assert record["resolved_symbol"] == "XAUUSD_o"
     assert record["source"] == ["mt5"]
     assert record["source_namespace"] == "connected_mt5_broker"
     assert record["status"] == "locked"

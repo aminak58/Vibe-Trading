@@ -589,6 +589,11 @@ def _normalize_symbol(value: Any) -> str:
     return f"{base}.{suffix}"
 
 
+def _provider_symbol(value: Any) -> str:
+    """Preserve provider-native spelling when persisting evidence fields."""
+    return str(value or "").strip()
+
+
 def _symbol_from_csv_filename(stem: str) -> str | None:
     """Map a run-dir CSV stem back to a canonical project symbol.
 
@@ -1871,12 +1876,12 @@ class GroundingLedger:
             source=source_names,
             candidates=candidates,
             requested_symbol=(
-                _normalize_symbol(chosen.get("requested_symbol"))
+                _provider_symbol(chosen.get("requested_symbol"))
                 if chosen.get("requested_symbol")
                 else None
             ),
             resolved_symbol=(
-                _normalize_symbol(chosen.get("resolved_symbol"))
+                _provider_symbol(chosen.get("resolved_symbol"))
                 if chosen.get("resolved_symbol")
                 else None
             ),
