@@ -51,6 +51,90 @@ logger = logging.getLogger(__name__)
 
 _WORKER_FILE_TOOLS = {"write_file", "edit_file"}
 _WRITE_FILE_PATH_KEYS = ("path", "file_path", "filepath", "filename", "file")
+_FACTOR_PANEL_ARTIFACT = "factor_input.factor_panel"
+_FORWARD_RETURN_PANEL_ARTIFACT = "factor_input.forward_return_panel"
+
+
+def _strict_factor_mode(identity: ExecutionIdentity | None) -> bool:
+    return bool(
+        identity
+        and identity.mode is ExecutionMode.SOURCE_SCOPED
+        and identity.policy.source_mode is SourceMode.STRICT
+        and identity.policy.synthetic is SyntheticDataPolicy.FORBID
+    )
+
+
+def _strict_factor_bundle(
+    identity: ExecutionIdentity,
+    run_dir: Path,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None,
+) -> dict[str, ArtifactRef] | None:
+    """Return the verified factor/forward-return pair granted to this worker."""
+    found: dict[str, ArtifactRef] = {}
+    for ref in (ref for refs in (upstream_artifacts or {}).values() for ref in refs):
+        if (
+            ref.artifact_type not in {_FACTOR_PANEL_ARTIFACT, _FORWARD_RETURN_PANEL_ARTIFACT}
+            or ref.producer_run_id != run_dir.name
+            or ref.execution_identity_hash != identity.identity_hash
+            or ref.provenance_status != "passed"
+            or not verify_registered_artifact(run_dir, ref)
+        ):
+            continue
+        found.setdefault(ref.artifact_type, ref)
+    if set(found) != {_FACTOR_PANEL_ARTIFACT, _FORWARD_RETURN_PANEL_ARTIFACT}:
+        return None
+    return found
+
+
+def _project_worker_tool_names(
+    tool_names: list[str],
+    identity: ExecutionIdentity | None,
+    run_dir: Path,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None,
+) -> list[str]:
+    """Hide unsupported quantitative tools before they reach the model."""
+    if not _strict_factor_mode(identity):
+        return list(tool_names)
+    assert identity is not None
+    if _strict_factor_bundle(identity, run_dir, upstream_artifacts) is not None:
+        return list(tool_names)
+    return [name for name in tool_names if name != "factor_analysis"]
+
+
+def _prepare_strict_factor_analysis_inputs(
+    identity: ExecutionIdentity | None,
+    arguments: dict[str, Any],
+    *,
+    run_dir: Path,
+    artifact_dir: Path,
+    upstream_artifacts: dict[str, list[ArtifactRef]] | None,
+) -> dict[str, Any] | None:
+    """Resolve opaque, declared factor-panel IDs into private runtime paths."""
+    if not _strict_factor_mode(identity):
+        return None
+    assert identity is not None
+    bundle = _strict_factor_bundle(identity, run_dir, upstream_artifacts)
+    if bundle is None:
+        return {
+            "status": "error",
+            "error_code": "identity_blocked",
+            "message": "Strict factor analysis requires a verified factor-input artifact bundle.",
+        }
+    for argument_name, artifact_type in (
+        ("factor_csv", _FACTOR_PANEL_ARTIFACT),
+        ("return_csv", _FORWARD_RETURN_PANEL_ARTIFACT),
+    ):
+        ref = bundle[artifact_type]
+        if arguments.get(argument_name) != f"artifact:{ref.artifact_id}":
+            return {
+                "status": "error",
+                "error_code": "identity_blocked",
+                "message": "Strict factor analysis accepts only declared opaque artifact IDs.",
+                "argument": argument_name,
+            }
+        arguments[argument_name] = str((run_dir / ref.run_relative_path).resolve(strict=True))
+    arguments["output_dir"] = str(artifact_dir / "factor_analysis")
+    return None
 
 
 def _bind_worker_file_path(
@@ -494,47 +578,11 @@ def _validate_worker_execution_identity(
     if identity.status is not ExecutionIdentityStatus.VERIFIED or not identity.requests:
         return {"status": "error", "error_code": "identity_blocked", "message": "Strict execution identity is not verified."}
     if tool_name == "factor_analysis":
-        if identity.policy.synthetic is not SyntheticDataPolicy.FORBID:
-            return None
-        if run_dir is None:
-            return {
-                "status": "error",
-                "error_code": "identity_blocked",
-                "message": "Strict factor analysis requires a server-owned artifact scope.",
-            }
-        allowed_refs = [
-            ref for refs in (upstream_artifacts or {}).values() for ref in refs
-        ]
-        for argument_name in ("factor_csv", "return_csv"):
-            raw_path = arguments.get(argument_name)
-            try:
-                requested_path = Path(str(raw_path)).resolve(strict=True)
-            except (OSError, RuntimeError, ValueError):
-                requested_path = None
-            admitted = False
-            for ref in allowed_refs:
-                if (
-                    ref.producer_run_id != run_dir.name
-                    or ref.execution_identity_hash != identity.identity_hash
-                    or ref.provenance_status != "passed"
-                    or not ref.artifact_type.startswith("market_data.")
-                    or not verify_registered_artifact(run_dir, ref)
-                ):
-                    continue
-                try:
-                    if requested_path == (run_dir / ref.run_relative_path).resolve(strict=True):
-                        admitted = True
-                        break
-                except (OSError, RuntimeError, ValueError):
-                    continue
-            if not admitted:
-                return {
-                    "status": "error",
-                    "error_code": "identity_blocked",
-                    "message": "Strict factor analysis requires verified upstream market-data artifacts.",
-                    "argument": argument_name,
-                }
-        return None
+        return {
+            "status": "error",
+            "error_code": "identity_blocked",
+            "message": "Strict factor analysis must be admitted through the server-owned artifact adapter.",
+        }
     if tool_name not in {"get_market_data", "backtest"}:
         return None
     request = identity.requests[0]
@@ -760,12 +808,15 @@ def _run_worker_impl(
 
     # 1. Build per-worker tool registry — local pool plus any operator-
     #    surfaced MCP tools, projected onto the agent's whitelist.
+    effective_tool_names = _project_worker_tool_names(
+        agent_spec.tools, execution_identity, run_dir, upstream_artifacts
+    )
     registry = build_swarm_registry(
-        [name for name in agent_spec.tools if name != ReadDependencyArtifactTool.name],
+        [name for name in effective_tool_names if name != ReadDependencyArtifactTool.name],
         agent_config=agent_config,
         include_shell_tools=include_shell_tools,
     )
-    if ReadDependencyArtifactTool.name in agent_spec.tools:
+    if ReadDependencyArtifactTool.name in effective_tool_names:
         allowed_refs = {
             ref.artifact_id: ref
             for refs in (upstream_artifacts or {}).values()
@@ -786,6 +837,12 @@ def _run_worker_impl(
         agent_spec, upstream_summaries, skill_desc, grounding_block=grounding_block,
         execution_identity=execution_identity, upstream_artifacts=upstream_artifacts,
     )
+    if "factor_analysis" in agent_spec.tools and "factor_analysis" not in effective_tool_names:
+        system_prompt += (
+            "\n\n## Server Capability Notice\n\n"
+            "Cross-sectional factor analysis is unavailable because no verified "
+            "factor-input artifact bundle was supplied. Do not create substitute data."
+        )
 
     # 4. Resolve prompt template with user vars (missing vars → LLM infers)
     class _FallbackDict(dict):
@@ -1183,7 +1240,18 @@ def _run_worker_impl(
                 # boundary before a child process can execute it.
                 args["__execution_identity"] = execution_identity
                 args["__swarm_run_id"] = run_dir.name
-            identity_error = _validate_worker_execution_identity(
+            factor_input_error = (
+                _prepare_strict_factor_analysis_inputs(
+                    execution_identity,
+                    args,
+                    run_dir=run_dir,
+                    artifact_dir=artifact_dir,
+                    upstream_artifacts=upstream_artifacts,
+                )
+                if tc.name == "factor_analysis"
+                else None
+            )
+            identity_error = factor_input_error or _validate_worker_execution_identity(
                 execution_identity,
                 tc.name,
                 args,

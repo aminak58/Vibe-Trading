@@ -19,7 +19,12 @@ from src.execution_identity import (
 )
 from src.swarm.presets import build_run_from_preset
 from src.swarm.artifacts import register_task_artifacts, verify_registered_artifact
-from src.swarm.worker import _validate_worker_execution_identity, build_worker_prompt
+from src.swarm.worker import (
+    _prepare_strict_factor_analysis_inputs,
+    _project_worker_tool_names,
+    _validate_worker_execution_identity,
+    build_worker_prompt,
+)
 from src.swarm.models import ArtifactRef, SwarmAgentSpec
 from src.tools.swarm_tool import SwarmTool, _build_variables
 
@@ -155,6 +160,104 @@ def _market_data_ref(run_dir: Path, *, identity_hash: str, text: str = "date,XAU
     })
 
 
+def _factor_bundle(run_dir: Path, *, identity_hash: str) -> list[ArtifactRef]:
+    refs = []
+    for filename, artifact_type in (
+        ("factor.csv", "factor_input.factor_panel"),
+        ("returns.csv", "factor_input.forward_return_panel"),
+    ):
+        path = run_dir / "artifacts" / "market_loader" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("date,A,B,C,D,E\n2026-01-01,1,2,3,4,5\n", encoding="utf-8")
+        [ref] = register_task_artifacts(
+            run_dir=run_dir,
+            task_id="task-market-data",
+            agent_id="market_loader",
+            artifact_paths=[path.relative_to(run_dir).as_posix()],
+            execution_identity_hash=identity_hash,
+        )
+        refs.append(ref.model_copy(update={
+            "artifact_type": artifact_type,
+            "provenance_status": "passed",
+        }))
+    return refs
+
+
+def test_strict_single_symbol_hides_factor_analysis_without_factor_bundle(tmp_path: Path) -> None:
+    tools = _project_worker_tool_names(
+        ["read_file", "factor_analysis"],
+        _verified_mt5_identity(),
+        tmp_path,
+        {},
+    )
+
+    assert tools == ["read_file"]
+
+
+def test_strict_valid_factor_bundle_enables_factor_analysis_by_opaque_ids(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    factor_ref, return_ref = _factor_bundle(tmp_path, identity_hash=identity.identity_hash)
+    tools = _project_worker_tool_names(
+        ["read_file", "factor_analysis"],
+        identity,
+        tmp_path,
+        {"market_data": [factor_ref, return_ref]},
+    )
+    arguments = {
+        "factor_csv": f"artifact:{factor_ref.artifact_id}",
+        "return_csv": f"artifact:{return_ref.artifact_id}",
+        "output_dir": "model-controlled",
+    }
+
+    error = _prepare_strict_factor_analysis_inputs(
+        identity,
+        arguments,
+        run_dir=tmp_path,
+        artifact_dir=tmp_path / "artifacts" / "factor_miner",
+        upstream_artifacts={"market_data": [factor_ref, return_ref]},
+    )
+
+    assert tools == ["read_file", "factor_analysis"]
+    assert error is None
+    assert Path(arguments["factor_csv"]) == tmp_path / factor_ref.run_relative_path
+    assert Path(arguments["return_csv"]) == tmp_path / return_ref.run_relative_path
+    assert Path(arguments["output_dir"]) == tmp_path / "artifacts" / "factor_miner" / "factor_analysis"
+
+
+def test_strict_factor_analysis_rejects_raw_paths_even_when_bundle_exists(tmp_path: Path) -> None:
+    identity = _verified_mt5_identity()
+    factor_ref, return_ref = _factor_bundle(tmp_path, identity_hash=identity.identity_hash)
+    arguments = {
+        "factor_csv": str(tmp_path / factor_ref.run_relative_path),
+        "return_csv": str(tmp_path / return_ref.run_relative_path),
+    }
+
+    error = _prepare_strict_factor_analysis_inputs(
+        identity,
+        arguments,
+        run_dir=tmp_path,
+        artifact_dir=tmp_path / "artifacts" / "factor_miner",
+        upstream_artifacts={"market_data": [factor_ref, return_ref]},
+    )
+
+    assert error is not None
+    assert error["error_code"] == "identity_blocked"
+
+
+def test_non_strict_factor_tool_projection_and_paths_stay_compatible(tmp_path: Path) -> None:
+    arguments = {"factor_csv": "f.csv", "return_csv": "r.csv", "output_dir": "out"}
+
+    assert _project_worker_tool_names(["factor_analysis"], None, tmp_path, {}) == ["factor_analysis"]
+    assert _prepare_strict_factor_analysis_inputs(
+        None,
+        arguments,
+        run_dir=tmp_path,
+        artifact_dir=tmp_path / "artifacts" / "factor_miner",
+        upstream_artifacts={},
+    ) is None
+    assert arguments["factor_csv"] == "f.csv"
+
+
 def test_strict_factor_analysis_rejects_raw_csv_without_registered_ref(tmp_path: Path) -> None:
     identity = _verified_mt5_identity()
     raw = tmp_path / "synthetic.csv"
@@ -172,13 +275,13 @@ def test_strict_factor_analysis_rejects_raw_csv_without_registered_ref(tmp_path:
     assert blocked["error_code"] == "identity_blocked"
 
 
-def test_strict_factor_analysis_accepts_verified_same_run_market_data_refs(tmp_path: Path) -> None:
+def test_strict_factor_analysis_rejects_raw_paths_even_if_they_match_a_registered_ref(tmp_path: Path) -> None:
     identity = _verified_mt5_identity()
     ref = _market_data_ref(tmp_path, identity_hash=identity.identity_hash)
     path = tmp_path / ref.run_relative_path
     assert verify_registered_artifact(tmp_path, ref)
 
-    allowed = _validate_worker_execution_identity(
+    blocked = _validate_worker_execution_identity(
         identity,
         "factor_analysis",
         {"factor_csv": str(path), "return_csv": str(path), "output_dir": str(tmp_path / "out")},
@@ -186,7 +289,8 @@ def test_strict_factor_analysis_accepts_verified_same_run_market_data_refs(tmp_p
         upstream_artifacts={"market_data": [ref]},
     )
 
-    assert allowed is None
+    assert blocked is not None
+    assert blocked["error_code"] == "identity_blocked"
 
 
 def test_strict_factor_analysis_rejects_tampered_registered_artifact(tmp_path: Path) -> None:
