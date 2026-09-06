@@ -15,6 +15,8 @@ from src.swarm.report_binding import (
     build_executed_strategy_binding,
     render_bound_strict_report,
 )
+from src.swarm.runtime import _is_strict_report_task
+from src.swarm.models import RunStatus, SwarmRun, SwarmTask
 
 
 def _ref(run_id: str, kind: str, path: str, text: str) -> ArtifactRef:
@@ -130,3 +132,12 @@ def test_quant_scalp_report_declares_all_executed_strategy_dependencies() -> Non
         ("task-backtest", "backtest.execution_provenance"),
         ("task-backtest", "backtest.strategy"),
     }.issubset(requirements)
+
+
+def test_non_strict_or_generic_report_is_not_subject_to_strict_binding() -> None:
+    generic = SwarmRun(
+        id="generic-run", preset_name="quant_strategy_desk", status=RunStatus.running,
+        created_at="2026-09-06T00:00:00+00:00",
+    )
+    task = SwarmTask(id="task-report", agent_id="report_aggregator", prompt_template="x")
+    assert _is_strict_report_task(generic, task) is False
