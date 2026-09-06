@@ -59,6 +59,7 @@ from src.swarm.report_binding import (
     NarrativeMismatch,
     build_executed_strategy_binding,
     render_bound_strict_report,
+    validate_executed_strategy_artifact_contents,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,16 @@ _STRICT_BACKTEST_ARTIFACTS = {
     "run_card.json": "backtest.run_card",
     "signal_engine.py": "backtest.strategy",
 }
+
+_STRICT_BACKTEST_REQUIRED_ARTIFACT_TYPES = (
+    "backtest.execution_provenance",
+    "backtest.config",
+    "backtest.metrics",
+    "backtest.trades",
+    "backtest.equity",
+    "backtest.run_card",
+    "backtest.strategy",
+)
 
 
 def _canonical_executed_strategy_path(refs: list[ArtifactRef], run_dir: Path) -> str | None:
@@ -169,6 +180,119 @@ def _is_strict_risk_task(run: SwarmRun, task: SwarmTask) -> bool:
         )
         == "strict"
     )
+
+
+def _is_strict_backtest_task(run: SwarmRun, task: SwarmTask) -> bool:
+    """Return whether this producer must fulfill the strict backtest bundle."""
+    identity = run.execution_identity
+    return bool(
+        run.preset_name == "quant_scalp_desk"
+        and task.id == "task-backtest"
+        and identity is not None
+        and getattr(getattr(identity, "mode", None), "value", None) == "source_scoped"
+        and getattr(
+            getattr(getattr(identity, "policy", None), "source_mode", None),
+            "value",
+            None,
+        )
+        == "strict"
+    )
+
+
+def _strict_backtest_artifact_contract_error(
+    run: SwarmRun,
+    task: SwarmTask,
+    refs: list[ArtifactRef],
+    run_dir: Path,
+    *,
+    manifest: object | None = None,
+) -> str | None:
+    """Return a structured strict-bundle failure, or ``None`` when valid.
+
+    Registration alone is intentionally insufficient: a strict worker can
+    write an arbitrary report after every backtest call has failed.  Before a
+    backtest task may become completed, each required evidence type must be a
+    same-run, same-producer, hash-verified, provenance-passed record.  Once a
+    generation has been finalized the exact current manifest also becomes part
+    of that contract.
+    """
+    missing: list[str] = []
+    invalid: list[str] = []
+    valid_by_type: dict[str, ArtifactRef] = {}
+    manifest_generation = getattr(manifest, "generation_id", None)
+    manifest_attempt = getattr(manifest, "producer_attempt_id", None)
+    manifest_ids = set(getattr(manifest, "artifact_ids", []))
+
+    if manifest is not None and (
+        not getattr(manifest, "finalized", False)
+        or getattr(manifest, "status", None) != "succeeded"
+        or getattr(manifest, "run_id", None) != run.id
+        or getattr(manifest, "producer_task_id", None) != task.id
+        or getattr(manifest, "identity_hash", None) != run.identity_hash
+    ):
+        invalid.append("artifact_manifest")
+
+    for artifact_type in _STRICT_BACKTEST_REQUIRED_ARTIFACT_TYPES:
+        candidates = [ref for ref in refs if ref.artifact_type == artifact_type]
+        valid = [
+            ref
+            for ref in candidates
+            if ref.producer_run_id == run.id
+            and ref.producer_task_id == task.id
+            and ref.producer_agent_id == task.agent_id
+            and ref.execution_identity_hash == run.identity_hash
+            and ref.provenance_status == "passed"
+            and verify_registered_artifact(run_dir, ref)
+            and (
+                manifest is None
+                or (
+                    ref.manifest_generation_id == manifest_generation
+                    and ref.producer_attempt_id == manifest_attempt
+                    and ref.artifact_id in manifest_ids
+                )
+            )
+        ]
+        if not candidates:
+            missing.append(artifact_type)
+        elif len(valid) != 1:
+            invalid.append(artifact_type)
+        else:
+            valid_by_type[artifact_type] = valid[0]
+
+    if not missing and not invalid:
+        try:
+            validate_executed_strategy_artifact_contents(
+                run_dir=run_dir,
+                official=valid_by_type,
+                identity_hash=run.identity_hash or "",
+            )
+        except ValueError as exc:
+            invalid.append("executed_strategy_binding(" + str(exc) + ")")
+
+    # The classifier establishes provenance and the manifest establishes
+    # generation authority.  The pre-existing strict report binding is the
+    # canonical verifier for the remaining executed config/strategy hashes.
+    # Reuse it here once the candidate generation is current, so a task cannot
+    # become completed with a bundle that the report layer would later reject.
+    if manifest is not None and not missing and not invalid:
+        try:
+            build_executed_strategy_binding(
+                run_dir=run_dir,
+                refs=refs,
+                run_id=run.id,
+                identity_hash=run.identity_hash or "",
+            )
+        except ValueError as exc:
+            invalid.append("executed_strategy_binding(" + str(exc) + ")")
+
+    if not missing and not invalid:
+        return None
+    parts: list[str] = []
+    if missing:
+        parts.append("missing=" + ",".join(missing))
+    if invalid:
+        parts.append("invalid=" + ",".join(invalid))
+    return "backtest_artifact_contract_incomplete: " + "; ".join(parts)
 
 
 def _classify_strict_risk_audit_report(
@@ -777,7 +901,6 @@ class SwarmRuntime:
                             })
 
                     if result.status == "completed":
-                        task_summaries[tid] = result.summary
                         now_iso = datetime.now(timezone.utc).isoformat()
                         artifact_refs = register_task_artifacts(
                             run_dir=run_dir,
@@ -787,8 +910,79 @@ class SwarmRuntime:
                             execution_identity_hash=run.identity_hash,
                         )
                         artifact_refs = _classify_authoritative_artifacts(run, task, artifact_refs, run_dir)
+                        contract_error = (
+                            _strict_backtest_artifact_contract_error(
+                                run, task, artifact_refs, run_dir
+                            )
+                            if _is_strict_backtest_task(run, task)
+                            else None
+                        )
+                        if contract_error is not None:
+                            all_succeeded = False
+                            task_store.update_status(
+                                tid,
+                                TaskStatus.failed,
+                                summary=result.summary,
+                                error=contract_error,
+                                completed_at=now_iso,
+                                artifacts=result.artifact_paths,
+                                artifact_refs=artifact_refs,
+                                worker_iterations=result.iterations,
+                            )
+                            self._emit_event(
+                                run_id,
+                                self._make_event(
+                                    "task_failed",
+                                    task_id=tid,
+                                    data={
+                                        "error_code": "backtest_artifact_contract_incomplete",
+                                        "error": contract_error,
+                                        "input_tokens": result.input_tokens,
+                                        "output_tokens": result.output_tokens,
+                                    },
+                                ),
+                            )
+                            continue
                         if artifact_refs:
-                            _, artifact_refs = finalize_artifact_generation(run_dir=run_dir, task_id=tid, identity_hash=run.identity_hash, refs=artifact_refs)
+                            manifest, artifact_refs = finalize_artifact_generation(
+                                run_dir=run_dir,
+                                task_id=tid,
+                                identity_hash=run.identity_hash,
+                                refs=artifact_refs,
+                            )
+                            contract_error = (
+                                _strict_backtest_artifact_contract_error(
+                                    run, task, artifact_refs, run_dir, manifest=manifest
+                                )
+                                if _is_strict_backtest_task(run, task)
+                                else None
+                            )
+                            if contract_error is not None:
+                                all_succeeded = False
+                                task_store.update_status(
+                                    tid,
+                                    TaskStatus.failed,
+                                    summary=result.summary,
+                                    error=contract_error,
+                                    completed_at=now_iso,
+                                    artifacts=result.artifact_paths,
+                                    artifact_refs=artifact_refs,
+                                    worker_iterations=result.iterations,
+                                )
+                                self._emit_event(
+                                    run_id,
+                                    self._make_event(
+                                        "task_failed",
+                                        task_id=tid,
+                                        data={
+                                            "error_code": "backtest_artifact_contract_incomplete",
+                                            "error": contract_error,
+                                            "input_tokens": result.input_tokens,
+                                            "output_tokens": result.output_tokens,
+                                        },
+                                    ),
+                                )
+                                continue
                         if _is_strict_risk_task(run, task):
                             artifact_refs = _classify_strict_risk_audit_report(
                                 run, task, artifact_refs, task_store, run_dir
@@ -797,6 +991,7 @@ class SwarmRuntime:
                             artifact_refs = _classify_legacy_risk_audit_report(
                                 run, task, artifact_refs, task_store, run_dir
                             )
+                        task_summaries[tid] = result.summary
                         task_store.update_status(
                             tid,
                             TaskStatus.completed,

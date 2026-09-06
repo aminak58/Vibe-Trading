@@ -11,7 +11,7 @@ import ast
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from src.swarm.artifacts import current_artifact_manifest, verify_registered_artifact
 from src.swarm.models import ArtifactRef
@@ -97,13 +97,17 @@ def _strategy_docstring(run_dir: Path, ref: ArtifactRef) -> str:
     raise ValueError("executed strategy has no SignalEngine docstring")
 
 
-def build_executed_strategy_binding(
-    *, run_dir: Path, refs: list[ArtifactRef], run_id: str, identity_hash: str
+def validate_executed_strategy_artifact_contents(
+    *, run_dir: Path, official: Mapping[str, ArtifactRef], identity_hash: str
 ) -> dict[str, str]:
-    """Return canonical report fields from hash-verified executed artifacts."""
-    official = _official_refs(
-        run_dir=run_dir, refs=refs, run_id=run_id, identity_hash=identity_hash
-    )
+    """Validate and render fields from already-authorized executed artifacts.
+
+    The runtime's strict task-output gate uses this after it has independently
+    checked producer, hash, and candidate artifact types but before it
+    atomically publishes a new artifact generation.  Keeping content/hash
+    validation here prevents the completion gate and report binding from
+    drifting apart.
+    """
     config = _read_json(run_dir, official["backtest.config"])
     run_card = _read_json(run_dir, official["backtest.run_card"])
     provenance = _read_json(run_dir, official["backtest.execution_provenance"])
@@ -132,6 +136,18 @@ def build_executed_strategy_binding(
         "strategy_sha256": official["backtest.strategy"].sha256,
         "strategy_logic": _strategy_docstring(run_dir, official["backtest.strategy"]),
     }
+
+
+def build_executed_strategy_binding(
+    *, run_dir: Path, refs: list[ArtifactRef], run_id: str, identity_hash: str
+) -> dict[str, str]:
+    """Return canonical report fields from hash-verified executed artifacts."""
+    official = _official_refs(
+        run_dir=run_dir, refs=refs, run_id=run_id, identity_hash=identity_hash
+    )
+    return validate_executed_strategy_artifact_contents(
+        run_dir=run_dir, official=official, identity_hash=identity_hash
+    )
 
 
 def render_bound_strict_report(binding: dict[str, str], worker_report: str) -> str:
