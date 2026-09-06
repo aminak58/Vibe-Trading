@@ -376,7 +376,11 @@ def test_late_terminal_failure_reconciles_actual_swarm_state(tmp_path: Path) -> 
     result = ledger.reconcile_owned_swarm(
         _official_terminal_run(status=RunStatus.failed), owner_session_id="session-1"
     )
-    assert result == {"status": "failed", "run_id": "swarm-20260906-045503-2373cf2c"}
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result["run_id"] == "swarm-20260906-045503-2373cf2c"
+    assert result["terminal_reason"] == "owned_swarm_terminal_failure"
+    assert result["artifact_status"]["task-backtest"]["status"] == "pending"
     assert ledger.obligation.status is WorkflowStatus.FAILED
 
 

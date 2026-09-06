@@ -299,13 +299,34 @@ class WorkflowObligationLedger:
 
         status = str(getattr(getattr(run, "status", None), "value", "")).casefold()
         if status in {"failed", "rejected"}:
+            task_errors = [
+                str(getattr(task, "error", "") or "").strip()
+                for task in getattr(run, "tasks", [])
+                if str(getattr(task, "error", "") or "").strip()
+            ]
+            terminal_reason = task_errors[0] if task_errors else "owned_swarm_terminal_failure"
+            artifact_status = {
+                str(getattr(task, "id", "")): {
+                    "status": (
+                        getattr(getattr(task, "status", None), "value", None)
+                        or str(getattr(task, "status", ""))
+                    ),
+                    "artifact_count": len(getattr(task, "artifact_refs", [])),
+                }
+                for task in getattr(run, "tasks", [])
+            }
             self._obligation = obligation.transition(
                 WorkflowStatus.FAILED,
                 terminal_result_status=status,
-                terminal_reason="owned_swarm_terminal_failure",
+                terminal_reason=terminal_reason,
             )
             self.persist()
-            return {"status": "failed", "run_id": obligation.swarm_run_id}
+            return {
+                "status": "failed",
+                "run_id": obligation.swarm_run_id,
+                "terminal_reason": terminal_reason,
+                "artifact_status": artifact_status,
+            }
         if status in {"cancelled", "canceled"}:
             self._obligation = obligation.transition(
                 WorkflowStatus.CANCELLED,

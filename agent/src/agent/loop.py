@@ -1181,6 +1181,46 @@ class AgentLoop:
         self._clear_completed_swarm_ownership(json.dumps(result))
         return result
 
+    def _reconcile_owned_swarm_before_final_response(self) -> dict[str, Any] | None:
+        """Make one server-owned terminal read before releasing a parent reply.
+
+        A Swarm can reach a terminal state just after its bounded wait returns.
+        The parent must not release a stale polling/no-metrics answer in that
+        narrow window.  This is deliberately a read/reconcile adapter over the
+        existing ownership ledger: it never dispatches, retries, or polls for
+        another interval.
+        """
+        reconciled = self._reconcile_owned_swarm_from_store()
+        if reconciled is None:
+            return None
+
+        status = str(reconciled.get("status") or "").casefold()
+        run_id = str(reconciled.get("run_id") or "")
+        if status == "completed":
+            official_report = str(reconciled.get("final_report") or "").strip()
+            content = official_report or (
+                f"The owned Swarm {run_id} completed with official artifacts: "
+                + ", ".join(str(value) for value in reconciled.get("artifact_ids", []))
+            )
+        elif status == "completed_with_artifact_gap":
+            missing = ", ".join(
+                str(value) for value in reconciled.get("missing_artifact_types", [])
+            ) or "required official artifacts"
+            content = (
+                f"The owned Swarm {run_id} completed, but its final result is invalid "
+                f"because required official artifacts are missing: {missing}."
+            )
+        else:
+            reason = str(reconciled.get("terminal_reason") or "").strip()
+            content = f"The owned Swarm {run_id} reached terminal status: {status}."
+            if reason:
+                content += f" Reason: {reason}."
+            artifact_status = reconciled.get("artifact_status")
+            if isinstance(artifact_status, dict):
+                content += " Official task artifact status is available for audit."
+
+        return {"reconciliation": reconciled, "content": content}
+
     def _swarm_ownership_block(self, tool_name: str) -> str | None:
         if self._active_swarm_run_id is None:
             return None
@@ -1916,6 +1956,29 @@ class AgentLoop:
                 "max_iterations": self.max_iterations,
             }
 
+        # A bounded Swarm wait may have returned just before the owned run
+        # persisted its terminal aggregate.  Make one final canonical read
+        # before deciding whether the model's answer may be released.  This
+        # replaces stale polling/no-backtest prose only when ownership and
+        # terminal-state validation already succeed; it cannot dispatch,
+        # retry, or substitute an execution path.
+        same_turn_swarm_reconciliation = self._reconcile_owned_swarm_before_final_response()
+        if same_turn_swarm_reconciliation is not None:
+            final_content = same_turn_swarm_reconciliation["content"]
+            trace.write(
+                {
+                    "type": "same_turn_swarm_reconciliation",
+                    "iter": self._run_iteration,
+                    "result": same_turn_swarm_reconciliation["reconciliation"],
+                }
+            )
+            react_trace.append(
+                {
+                    "type": "same_turn_swarm_reconciliation",
+                    "status": same_turn_swarm_reconciliation["reconciliation"].get("status"),
+                }
+            )
+
         # Determine final status. The reason is also propagated into the
         # returned dict so SessionService can surface a meaningful UI
         # message instead of "Execution failed: unknown" (issue #114).
@@ -1997,6 +2060,8 @@ class AgentLoop:
         }
         if reconciled_swarm_result is not None:
             result["swarm_reconciliation"] = reconciled_swarm_result
+        if same_turn_swarm_reconciliation is not None:
+            result["swarm_reconciliation"] = same_turn_swarm_reconciliation["reconciliation"]
         if self._released_fallback:
             result["degraded"] = True
         configured_model = self._llm_runtime.configured_model
