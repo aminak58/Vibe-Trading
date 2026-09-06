@@ -116,6 +116,120 @@ def _is_strict_report_task(run: SwarmRun, task: SwarmTask) -> bool:
     )
 
 
+def _is_strict_risk_task(run: SwarmRun, task: SwarmTask) -> bool:
+    """Return whether server-side risk-output admission is mandatory."""
+    identity = run.execution_identity
+    return bool(
+        task.id == "task-risk"
+        and identity is not None
+        and getattr(getattr(identity, "mode", None), "value", None) == "source_scoped"
+        and getattr(
+            getattr(getattr(identity, "policy", None), "source_mode", None),
+            "value",
+            None,
+        )
+        == "strict"
+    )
+
+
+def _classify_strict_risk_audit_report(
+    run: SwarmRun,
+    task: SwarmTask,
+    refs: list[ArtifactRef],
+    task_store: TaskStore,
+    run_dir: Path,
+) -> list[ArtifactRef]:
+    """Admit a risk report only from the current verified backtest bundle."""
+    if not _is_strict_risk_task(run, task) or not task.artifact_requirements:
+        return refs
+    manifest = current_artifact_manifest(run_dir, "task-backtest")
+    if (
+        manifest is None
+        or not manifest.finalized
+        or manifest.status != "succeeded"
+        or manifest.run_id != run.id
+        or manifest.producer_task_id != "task-backtest"
+        or manifest.identity_hash != run.identity_hash
+    ):
+        return refs
+
+    consumed: set[str] = set()
+    for requirement in task.artifact_requirements:
+        try:
+            producer = task_store.load_task(requirement.producer_task_id)
+        except FileNotFoundError:
+            return refs
+        matches = [
+            ref
+            for ref in producer.artifact_refs
+            if ref.producer_run_id == run.id
+            and ref.producer_task_id == requirement.producer_task_id
+            and ref.producer_agent_id == producer.agent_id
+            and ref.artifact_type == requirement.artifact_type
+            and ref.provenance_status == "passed"
+            and ref.execution_identity_hash == run.identity_hash
+            and ref.manifest_generation_id == manifest.generation_id
+            and ref.producer_attempt_id == manifest.producer_attempt_id
+            and ref.artifact_id in manifest.artifact_ids
+            and verify_registered_artifact(run_dir, ref)
+        ]
+        if requirement.required and not matches:
+            return refs
+        consumed.update(ref.artifact_id for ref in matches)
+
+    if not consumed:
+        return refs
+    return [
+        ref.model_copy(
+            update={
+                "artifact_type": "risk.audit_report",
+                "provenance_status": "passed",
+                "derived_from_artifact_ids": sorted(consumed),
+                "derived_from_manifest_generation": manifest.generation_id,
+            }
+        )
+        if Path(ref.run_relative_path).name == "report.md"
+        else ref
+        for ref in refs
+    ]
+
+
+def _classify_legacy_risk_audit_report(
+    run: SwarmRun, task: SwarmTask, refs: list[ArtifactRef], task_store: TaskStore, run_dir: Path
+) -> list[ArtifactRef]:
+    """Preserve pre-existing generic risk-report classification semantics."""
+    if task.id != "task-risk" or not task.artifact_requirements:
+        return refs
+    consumed: list[str] = []
+    for requirement in task.artifact_requirements:
+        producer = task_store.load_task(requirement.producer_task_id)
+        consumed.extend(
+            ref.artifact_id
+            for ref in producer.artifact_refs
+            if ref.artifact_type == requirement.artifact_type
+            and ref.provenance_status == "passed"
+            and ref.execution_identity_hash == run.identity_hash
+        )
+    if len(consumed) != len(task.artifact_requirements):
+        return refs
+    source_manifest = current_artifact_manifest(run_dir, "task-backtest")
+    return [
+        ref.model_copy(
+            update={
+                "artifact_type": "risk.audit_report",
+                "provenance_status": "passed",
+                "derived_from_artifact_ids": sorted(consumed),
+                "derived_from_manifest_generation": (
+                    source_manifest.generation_id if source_manifest else None
+                ),
+            }
+        )
+        if Path(ref.run_relative_path).name == "report.md"
+        else ref
+        for ref in refs
+    ]
+
+
 def _strict_report_binding(run: SwarmRun, task_store: TaskStore, run_dir: Path) -> dict[str, str]:
     backtest = task_store.load_task("task-backtest")
     return build_executed_strategy_binding(
@@ -636,24 +750,14 @@ class SwarmRuntime:
                         artifact_refs = _classify_authoritative_artifacts(run, task, artifact_refs, run_dir)
                         if artifact_refs:
                             _, artifact_refs = finalize_artifact_generation(run_dir=run_dir, task_id=tid, identity_hash=run.identity_hash, refs=artifact_refs)
-                        if task.id == "task-risk" and task.artifact_requirements:
-                            consumed = []
-                            for requirement in task.artifact_requirements:
-                                producer = task_store.load_task(requirement.producer_task_id)
-                                consumed.extend(
-                                    ref.artifact_id for ref in producer.artifact_refs
-                                    if ref.artifact_type == requirement.artifact_type
-                                    and ref.provenance_status == "passed"
-                                    and ref.execution_identity_hash == run.identity_hash
-                                )
-                            if len(consumed) == len(task.artifact_requirements):
-                                source_manifest = current_artifact_manifest(run_dir, "task-backtest")
-                                artifact_refs = [ref.model_copy(update={
-                                    "artifact_type": "risk.audit_report" if Path(ref.run_relative_path).name == "report.md" else ref.artifact_type,
-                                    "provenance_status": "passed" if Path(ref.run_relative_path).name == "report.md" else ref.provenance_status,
-                                    "derived_from_artifact_ids": sorted(consumed) if Path(ref.run_relative_path).name == "report.md" else ref.derived_from_artifact_ids,
-                                    "derived_from_manifest_generation": (source_manifest.generation_id if source_manifest else None) if Path(ref.run_relative_path).name == "report.md" else ref.derived_from_manifest_generation,
-                                }) for ref in artifact_refs]
+                        if _is_strict_risk_task(run, task):
+                            artifact_refs = _classify_strict_risk_audit_report(
+                                run, task, artifact_refs, task_store, run_dir
+                            )
+                        else:
+                            artifact_refs = _classify_legacy_risk_audit_report(
+                                run, task, artifact_refs, task_store, run_dir
+                            )
                         task_store.update_status(
                             tid,
                             TaskStatus.completed,
