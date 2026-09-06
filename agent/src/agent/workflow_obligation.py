@@ -16,6 +16,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from src.agent.current_user_intent import explicit_source_from_current_user_message
+
 
 WORKFLOW_OBLIGATION_ARTIFACT = "workflow_obligation.json"
 
@@ -115,6 +117,18 @@ _NON_DIRECTIVE_SWARM_RE = re.compile(
 _QUOTED_RE = re.compile(r"(?P<quote>['\"])(?:\\.|(?!\1).)*(?P=quote)")
 _CODE_SPAN_RE = re.compile(r"`[^`]*`")
 _BLOCK_QUOTE_RE = re.compile(r"(?m)^\s*>.*$")
+_PERSIAN_SWARM_DIRECTIVE_RE = re.compile(
+    r"(?:"
+    r"\u0628\u0627\s+\u0627\u0633\u062a\u0641\u0627\u062f\u0647\s+\u0627\u0632\s+(?:swarm|\u0633\u0648\u0627\u0631\u0645)"
+    r"|\u0628\u0627\s+(?:swarm|\u0633\u0648\u0627\u0631\u0645)\s+(?:\u0627\u0631\u0632\u06cc\u0627\u0628\u06cc|\u0627\u062c\u0631\u0627|\u0627\u0633\u062a\u0641\u0627\u062f\u0647|\u0627\u0646\u062c\u0627\u0645)"
+    r"|\u0627\u0632\s+(?:swarm|\u0633\u0648\u0627\u0631\u0645)\s+\u0627\u0633\u062a\u0641\u0627\u062f\u0647\s+\u06a9\u0646"
+    r")",
+    re.IGNORECASE,
+)
+_PERSIAN_NEGATED_SWARM_RE = re.compile(
+    r"(?:\u0628\u062f\u0648\u0646\s+(?:swarm|\u0633\u0648\u0627\u0631\u0645)|\u0627\u0632\s+(?:swarm|\u0633\u0648\u0627\u0631\u0645)\s+\u0627\u0633\u062a\u0641\u0627\u062f\u0647\s+\u0646\u06a9\u0646)",
+    re.IGNORECASE,
+)
 
 
 def _directive_text(user_message: str) -> str:
@@ -128,7 +142,11 @@ def _directive_text(user_message: str) -> str:
 def obligation_from_current_user_message(user_message: str) -> WorkflowObligation:
     """Parse only this turn's raw user message into a bounded obligation."""
     text = _directive_text(user_message)
-    if _NEGATED_SWARM_RE.search(text) or _NON_DIRECTIVE_SWARM_RE.search(text):
+    if (
+        _NEGATED_SWARM_RE.search(text)
+        or _PERSIAN_NEGATED_SWARM_RE.search(text)
+        or _NON_DIRECTIVE_SWARM_RE.search(text)
+    ):
         return WorkflowObligation(mode=WorkflowMode.NONE)
     preset_match = _PRESET_DIRECTIVE_RE.search(text)
     if preset_match:
@@ -150,7 +168,18 @@ def obligation_from_current_user_message(user_message: str) -> WorkflowObligatio
                 source_scoped_execution=True,
             ),
         )
-    if _SWARM_DIRECTIVE_RE.search(text):
+    if _SWARM_DIRECTIVE_RE.search(text) or _PERSIAN_SWARM_DIRECTIVE_RE.search(text):
+        # The capability remains a server-side requirement rather than a
+        # prose-selected preset.  It is activated only by a whitelisted raw
+        # current-user MT5 source directive.
+        if explicit_source_from_current_user_message(text) == "mt5":
+            return WorkflowObligation(
+                mode=WorkflowMode.SWARM_REQUIRED,
+                preset_requirement=PresetRequirement(
+                    kind=PresetRequirementKind.CAPABILITY,
+                    source_scoped_execution=True,
+                ),
+            )
         return WorkflowObligation(mode=WorkflowMode.SWARM_REQUIRED)
     return WorkflowObligation(mode=WorkflowMode.NONE)
 

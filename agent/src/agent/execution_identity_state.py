@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from uuid import uuid4
 
+from src.agent.current_user_intent import explicit_source_from_current_user_message
 from src.execution_identity import (
     AttachmentAssertionType,
     ExecutionIdentity,
@@ -26,7 +27,6 @@ from src.execution_identity import (
 
 
 EXECUTION_IDENTITY_ARTIFACT = "execution_identity.json"
-_EXPLICIT_SOURCE_RE = re.compile(r"\bsource\s*(?:=|:)\s*['\"]?([a-z0-9_-]+)", re.IGNORECASE)
 _SYMBOL_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,11}(?:[./_-][A-Z0-9]{1,11})?\b")
 _DECLARED_SYMBOL_RE = re.compile(
     r"(?:^|\n)\s*(?:requested\s+)?(?:symbol|ticker|instrument)\s*[:=]\s*([^\n]+)",
@@ -260,8 +260,7 @@ class ExecutionIdentityLedger:
 
     @staticmethod
     def _from_user_message(user_message: str) -> ExecutionIdentity:
-        source_match = _EXPLICIT_SOURCE_RE.search(user_message or "")
-        source = source_match.group(1).casefold() if source_match else None
+        source = explicit_source_from_current_user_message(user_message)
         symbol = _first_symbol(user_message)
         if source:
             policy = ExecutionPolicy(

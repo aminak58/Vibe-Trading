@@ -31,13 +31,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from src.agent.current_user_intent import explicit_source_from_current_user_message
 from src.execution_identity import ExecutionIdentity, ExecutionIdentityStatus, ExecutionMode, SourceMode
 
 
 GROUNDING_ARTIFACT = "grounding_evidence.json"
 
 _RESOLVER_TOOL = "search_symbol"
-_EXPLICIT_SOURCE_RE = re.compile(r"\bsource\s*(?:=|:)\s*['\"]?([a-z0-9_-]+)", re.IGNORECASE)
 _PRIVATE_COMPANY_SKILL_NAMES = {
     "private-company",
     "private-company-analysis",
@@ -1002,8 +1002,7 @@ class GroundingLedger:
         self._price_evidence_attempts = 0
         self._ingested_csvs: set[str] = set()
         self._identity_required = bool(_ACTIONABLE_MARKET_RE.search(user_message))
-        source_match = _EXPLICIT_SOURCE_RE.search(user_message or "")
-        self._explicit_source = source_match.group(1).casefold() if source_match else None
+        self._explicit_source = explicit_source_from_current_user_message(user_message)
         self._execution_identity = execution_identity
         self._buffer_output = self._identity_required
         # Every instrument this run is entitled to write about: the ones the
