@@ -163,6 +163,78 @@ def test_official_start_registers_session_ownership_before_wait_budget_exhausts(
     assert index["status"] == "running"
 
 
+@pytest.mark.parametrize(
+    ("status", "obligation_status"),
+    (
+        ("failed", "failed"),
+        ("completed", "completed"),
+        ("cancelled", "cancelled"),
+        ("rejected", "failed"),
+    ),
+)
+def test_terminal_run_swarm_result_converges_all_owned_state_views(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: str,
+    obligation_status: str,
+) -> None:
+    """The direct tool result path must not leave its index running."""
+    owner, old_dir = _old_owner(tmp_path)
+    sessions = _configure_roots(monkeypatch, tmp_path, _owned_run(RunStatus.failed))
+    owner._workflow_obligation = WorkflowObligationLedger(run_dir=old_dir, user_message="continue")
+    owner._persist_swarm_ownership("running")
+    owner._persist_session_swarm_ownership("running")
+    assert owner._workflow_obligation.obligation.mode.value == "swarm_required"
+    assert owner._workflow_obligation.obligation.swarm_run_id == SWARM
+
+    owner._record_owned_swarm_tool_result(
+        json.dumps({"run_id": SWARM, "status": status, "terminal_reason": "terminal-test"})
+    )
+
+    assert json.loads((old_dir / "workflow_obligation.json").read_text())["status"] == obligation_status
+    assert json.loads((old_dir / "swarm_ownership.json").read_text())["status"] == status
+    index = json.loads((sessions / SESSION / "swarm_ownership.json").read_text())
+    assert index["status"] == status
+    assert index["terminal_reason"] == "terminal-test"
+    assert owner._active_swarm_run_id is None
+
+
+def test_mismatched_terminal_tool_result_does_not_mutate_owned_views(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner, old_dir = _old_owner(tmp_path)
+    sessions = _configure_roots(monkeypatch, tmp_path, _owned_run(RunStatus.failed))
+    owner._workflow_obligation = WorkflowObligationLedger(run_dir=old_dir, user_message="continue")
+    owner._persist_swarm_ownership("running")
+    owner._persist_session_swarm_ownership("running")
+
+    owner._record_owned_swarm_tool_result(
+        json.dumps({"run_id": "other-swarm", "status": "failed"})
+    )
+
+    assert json.loads((old_dir / "workflow_obligation.json").read_text())["status"] == "waiting"
+    assert json.loads((old_dir / "swarm_ownership.json").read_text())["status"] == "running"
+    assert json.loads((sessions / SESSION / "swarm_ownership.json").read_text())["status"] == "running"
+
+
+def test_repeated_terminal_tool_result_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    owner, old_dir = _old_owner(tmp_path)
+    sessions = _configure_roots(monkeypatch, tmp_path, _owned_run(RunStatus.failed))
+    owner._workflow_obligation = WorkflowObligationLedger(run_dir=old_dir, user_message="continue")
+    owner._persist_swarm_ownership("running")
+    owner._persist_session_swarm_ownership("running")
+    result = json.dumps({"run_id": SWARM, "status": "failed", "terminal_reason": "terminal-test"})
+
+    owner._record_owned_swarm_tool_result(result)
+    owner._record_owned_swarm_tool_result(result)
+
+    assert json.loads((old_dir / "workflow_obligation.json").read_text())["status"] == "failed"
+    assert json.loads((old_dir / "swarm_ownership.json").read_text())["status"] == "failed"
+    assert json.loads((sessions / SESSION / "swarm_ownership.json").read_text())["status"] == "failed"
+
+
 def test_repeated_session_recovery_returns_the_same_terminal_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

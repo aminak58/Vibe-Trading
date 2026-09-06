@@ -1189,6 +1189,22 @@ class AgentLoop:
         self._persist_swarm_ownership("running")
         self._persist_session_swarm_ownership("running")
 
+    def _record_owned_swarm_tool_result(self, result: str) -> None:
+        """Apply one ``run_swarm`` result to every owned-state projection.
+
+        A bounded wait may return the terminal result directly.  That path
+        used to transition only WorkflowObligation, leaving the parent marker
+        and trusted-session index falsely ``running``.  The existing clearer
+        is exact-run guarded and no-ops for non-terminal results, so it is the
+        one ownership convergence point for both direct results and later
+        status/recovery reads.
+        """
+        self._record_swarm_ownership(result)
+        workflow_obligation = getattr(self, "_workflow_obligation", None)
+        if workflow_obligation is not None:
+            workflow_obligation.record_swarm_result(result)
+        self._clear_completed_swarm_ownership(result)
+
     def _bind_started_swarm_run(self, run_id: str) -> None:
         """Bind and index a launched Swarm before its bounded wait begins."""
         workflow_obligation = getattr(self, "_workflow_obligation", None)
@@ -3207,10 +3223,7 @@ class AgentLoop:
                 self._grounding.set_execution_identity(self._execution_identity.snapshot())
 
         if update_ownership and tc.name == "run_swarm":
-            self._record_swarm_ownership(result)
-            workflow_obligation = getattr(self, "_workflow_obligation", None)
-            if workflow_obligation is not None:
-                workflow_obligation.record_swarm_result(result)
+            self._record_owned_swarm_tool_result(result)
         elif update_ownership and tc.name == "get_swarm_status":
             self._clear_completed_swarm_ownership(result)
             workflow_obligation = getattr(self, "_workflow_obligation", None)
