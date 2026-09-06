@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 from src.agent.context import ContextBuilder
 from src.agent.grounding import GroundingLedger
 from src.agent.execution_identity_state import ExecutionIdentityLedger
-from src.agent.workflow_obligation import WorkflowObligationLedger
+from src.agent.workflow_obligation import WorkflowMode, WorkflowObligationLedger
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
 from src.agent.tools import ToolRegistry
@@ -1069,6 +1069,103 @@ class AgentLoop:
         except OSError:
             logger.warning("could not persist swarm ownership", exc_info=True)
 
+    def _session_swarm_ownership_path(self) -> Path | None:
+        session_id = self._trusted_owner_session_id
+        if not session_id or Path(session_id).name != session_id:
+            return None
+        return SESSIONS_DIR / session_id / "swarm_ownership.json"
+
+    def _persist_session_swarm_ownership(
+        self,
+        status: str,
+        *,
+        terminal_reason: str | None = None,
+        terminal_result: dict[str, Any] | None = None,
+        parent_run_id: str | None = None,
+    ) -> None:
+        """Persist the one server-owned Swarm ownership record for a session."""
+        path = self._session_swarm_ownership_path()
+        run_dir = Path(self.memory.run_dir) if self.memory.run_dir else None
+        if path is None or run_dir is None or Path(run_dir.name).name != run_dir.name:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        resolved_parent_run_id = parent_run_id or run_dir.name
+        if Path(resolved_parent_run_id).name != resolved_parent_run_id:
+            return
+        payload = {
+            "schema_version": "session-swarm-ownership/v1",
+            "session_id": self._trusted_owner_session_id,
+            "parent_run_id": resolved_parent_run_id,
+            "swarm_run_id": self._active_swarm_run_id,
+            "identity_hash": self._active_swarm_identity_hash,
+            "launch_id": self._active_swarm_launch_id,
+            "status": status,
+            "updated_at": now,
+        }
+        if terminal_reason is not None:
+            payload["terminal_reason"] = terminal_reason
+        if terminal_result is not None:
+            payload["terminal_result"] = terminal_result
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            prior = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            payload["created_at"] = prior.get("created_at") or now
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(path)
+        except (OSError, ValueError):
+            logger.warning("could not persist session swarm ownership", exc_info=True)
+
+    def _load_session_swarm_ownership(self) -> dict[str, Any] | None:
+        """Load a trusted session's latest indexed ownership record.
+
+        A one-time legacy scan migrates only an exact old parent ownership
+        record for this session.  It is not prompt or model driven.
+        """
+        path = self._session_swarm_ownership_path()
+        if path is not None:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and payload.get("session_id") == self._trusted_owner_session_id:
+                    return payload
+            except (OSError, ValueError):
+                pass
+        if not self._trusted_owner_session_id or not RUNS_DIR.exists():
+            return None
+        candidates: list[tuple[float, dict[str, Any]]] = []
+        for parent_dir in RUNS_DIR.iterdir():
+            if not parent_dir.is_dir() or Path(parent_dir.name).name != parent_dir.name:
+                continue
+            ownership_path = parent_dir / "swarm_ownership.json"
+            try:
+                ownership = json.loads(ownership_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if (
+                not isinstance(ownership, dict)
+                or ownership.get("owner_session_id") != self._trusted_owner_session_id
+                or not ownership.get("run_id")
+                or not ownership.get("launch_id")
+            ):
+                continue
+            candidates.append((ownership_path.stat().st_mtime, {**ownership, "parent_run_id": parent_dir.name}))
+        if not candidates:
+            return None
+        _, legacy = max(candidates, key=lambda item: item[0])
+        self._active_swarm_run_id = str(legacy["run_id"])
+        self._active_swarm_identity_hash = str(legacy.get("identity_hash") or "") or None
+        self._active_swarm_launch_id = str(legacy["launch_id"])
+        self._active_swarm_owner_session_id = self._trusted_owner_session_id
+        self._persist_session_swarm_ownership(
+            str(legacy.get("status") or "running"),
+            parent_run_id=str(legacy["parent_run_id"]),
+        )
+        path = self._session_swarm_ownership_path()
+        try:
+            return json.loads(path.read_text(encoding="utf-8")) if path else None
+        except (OSError, ValueError):
+            return None
+
     def _record_swarm_ownership(self, result: str) -> None:
         try:
             payload = json.loads(result)
@@ -1090,6 +1187,27 @@ class AgentLoop:
         )
         self._active_swarm_owner_session_id = self._trusted_owner_session_id
         self._persist_swarm_ownership("running")
+        self._persist_session_swarm_ownership("running")
+
+    def _bind_started_swarm_run(self, run_id: str) -> None:
+        """Bind and index a launched Swarm before its bounded wait begins."""
+        workflow_obligation = getattr(self, "_workflow_obligation", None)
+        if workflow_obligation is not None:
+            workflow_obligation.bind_swarm_run(run_id)
+        self._active_swarm_run_id = run_id
+        self._active_swarm_identity_hash = (
+            self._execution_identity.snapshot().identity_hash
+            if self._execution_identity is not None
+            else None
+        )
+        self._active_swarm_launch_id = (
+            getattr(workflow_obligation.obligation, "launch_id", None)
+            if workflow_obligation is not None
+            else None
+        )
+        self._active_swarm_owner_session_id = self._trusted_owner_session_id
+        self._persist_swarm_ownership("running")
+        self._persist_session_swarm_ownership("running")
 
     def _clear_completed_swarm_ownership(self, result: str) -> None:
         try:
@@ -1105,10 +1223,119 @@ class AgentLoop:
             if reason is None:
                 reason = f"owned_swarm_terminal_{'failure' if status == 'failed' else status}"
             self._persist_swarm_ownership(status, terminal_reason=reason)
+            self._persist_session_swarm_ownership(status, terminal_reason=reason)
             self._active_swarm_run_id = None
             self._active_swarm_identity_hash = None
             self._active_swarm_launch_id = None
             self._active_swarm_owner_session_id = None
+
+    def _reconcile_session_owned_swarm_from_store(self) -> dict[str, Any] | None:
+        """Reconcile a prior UI parent run through the trusted session index."""
+        index = self._load_session_swarm_ownership()
+        if index is None or index.get("session_id") != self._trusted_owner_session_id:
+            return None
+        parent_run_id = str(index.get("parent_run_id") or "")
+        swarm_run_id = str(index.get("swarm_run_id") or "")
+        launch_id = str(index.get("launch_id") or "")
+        if (
+            not parent_run_id
+            or Path(parent_run_id).name != parent_run_id
+            or not swarm_run_id
+            or not launch_id
+        ):
+            return None
+        from src.swarm.store import SwarmStore, swarm_runs_root
+
+        store = SwarmStore(base_dir=swarm_runs_root())
+        run = store.load_run(swarm_run_id)
+        if (
+            run is None
+            or run.owner_session_id != self._trusted_owner_session_id
+            or run.launch_id != launch_id
+        ):
+            return None
+        reconciled = store.reconcile_run(run, write=True)
+        status = reconciled.status.value if hasattr(reconciled.status, "value") else str(reconciled.status)
+        if status not in {"completed", "failed", "cancelled", "rejected"}:
+            return {"status": "running", "run_id": swarm_run_id}
+        persisted_result = index.get("terminal_result")
+        if isinstance(persisted_result, dict) and persisted_result.get("status"):
+            return persisted_result
+
+        parent_dir = RUNS_DIR / parent_run_id
+        ownership_path = parent_dir / "swarm_ownership.json"
+        try:
+            ownership = json.loads(ownership_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if (
+            ownership.get("run_id") != swarm_run_id
+            or ownership.get("launch_id") != launch_id
+            or ownership.get("owner_session_id") != self._trusted_owner_session_id
+        ):
+            return None
+        old_obligation = WorkflowObligationLedger(run_dir=parent_dir, user_message="")
+        result = old_obligation.reconcile_owned_swarm(
+            reconciled, owner_session_id=self._trusted_owner_session_id
+        )
+        if result is None:
+            return None
+        terminal_status = "failed" if result["status"] == "completed_with_artifact_gap" else result["status"]
+        ownership["status"] = terminal_status
+        ownership["terminal_reason"] = str(result.get("terminal_reason") or result["status"])
+        try:
+            ownership_path.write_text(json.dumps(ownership, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError:
+            logger.warning("could not reconcile old parent swarm ownership", exc_info=True)
+            return None
+        self._active_swarm_run_id = swarm_run_id
+        self._active_swarm_identity_hash = str(index.get("identity_hash") or "") or None
+        self._active_swarm_launch_id = launch_id
+        self._active_swarm_owner_session_id = self._trusted_owner_session_id
+        self._persist_session_swarm_ownership(
+            terminal_status,
+            terminal_reason=ownership["terminal_reason"],
+            terminal_result=result,
+            parent_run_id=parent_run_id,
+        )
+        self._active_swarm_run_id = None
+        self._active_swarm_identity_hash = None
+        self._active_swarm_launch_id = None
+        self._active_swarm_owner_session_id = None
+        return result
+
+    def _restore_active_session_swarm_if_running(self) -> None:
+        """Restore only an exact still-running indexed Swarm as a dispatch block.
+
+        A new current-user request must not launch a replacement while a
+        previous parent run in this trusted session still owns an active run.
+        This is a read-only guard; terminal recovery remains the responsibility
+        of ``_reconcile_session_owned_swarm_from_store``.
+        """
+        if self._active_swarm_run_id is not None:
+            return
+        index = self._load_session_swarm_ownership()
+        if index is None or str(index.get("status") or "").casefold() not in {"running", "pending"}:
+            return
+        swarm_run_id = str(index.get("swarm_run_id") or "")
+        launch_id = str(index.get("launch_id") or "")
+        if not swarm_run_id or not launch_id:
+            return
+        from src.swarm.store import SwarmStore, swarm_runs_root
+
+        run = SwarmStore(base_dir=swarm_runs_root()).load_run(swarm_run_id)
+        status = str(getattr(getattr(run, "status", None), "value", "")).casefold()
+        if (
+            run is None
+            or run.owner_session_id != self._trusted_owner_session_id
+            or run.launch_id != launch_id
+            or status not in {"pending", "running"}
+        ):
+            return
+        self._active_swarm_run_id = swarm_run_id
+        self._active_swarm_identity_hash = str(index.get("identity_hash") or "") or None
+        self._active_swarm_launch_id = launch_id
+        self._active_swarm_owner_session_id = self._trusted_owner_session_id
 
     def _reconcile_owned_swarm_from_store(self) -> dict[str, Any] | None:
         """Recover an owned Swarm terminal result from server-owned storage.
@@ -1194,6 +1421,14 @@ class AgentLoop:
         if reconciled is None:
             return None
 
+        return {
+            "reconciliation": reconciled,
+            "content": self._render_owned_swarm_terminal_response(reconciled),
+        }
+
+    @staticmethod
+    def _render_owned_swarm_terminal_response(reconciled: dict[str, Any]) -> str:
+        """Render an official terminal result without consulting model prose."""
         status = str(reconciled.get("status") or "").casefold()
         run_id = str(reconciled.get("run_id") or "")
         if status == "completed":
@@ -1219,9 +1454,10 @@ class AgentLoop:
             if isinstance(artifact_status, dict):
                 content += " Official task artifact status is available for audit."
 
-        return {"reconciliation": reconciled, "content": content}
+        return content
 
     def _swarm_ownership_block(self, tool_name: str) -> str | None:
+        self._restore_active_session_swarm_if_running()
         if self._active_swarm_run_id is None:
             return None
         if tool_name not in {"run_swarm", "backtest", "get_market_data"}:
@@ -1300,6 +1536,14 @@ class AgentLoop:
         # in the background.  Reconcile its persisted terminal state before
         # the parent can plan a new turn; this performs no dispatch or retry.
         reconciled_swarm_result = self._reconcile_owned_swarm_from_store()
+        session_recovered_swarm_result = None
+        if (
+            reconciled_swarm_result is None
+            and self._workflow_obligation.obligation.mode is WorkflowMode.NONE
+        ):
+            session_recovered_swarm_result = self._reconcile_session_owned_swarm_from_store()
+            if session_recovered_swarm_result is not None:
+                reconciled_swarm_result = session_recovered_swarm_result
         self._grounding = GroundingLedger(
             run_dir=run_dir,
             user_message=user_message,
@@ -1355,6 +1599,53 @@ class AgentLoop:
             value=user_message,
             offload_kind=f"user-message-{self._run_iteration + 1}",
         )
+
+        if session_recovered_swarm_result is not None:
+            # Cross-parent recovery is a server-owned status operation.  Do
+            # not spend a model turn or permit tool calls merely to paraphrase
+            # a terminal result which is already authoritative.
+            final_content = self._render_owned_swarm_terminal_response(
+                session_recovered_swarm_result
+            )
+            state_store.mark_success(run_dir)
+            trace.write(
+                {
+                    "type": "session_swarm_reconciliation",
+                    "iter": self._run_iteration + 1,
+                    "result": session_recovered_swarm_result,
+                }
+            )
+            trace.write(
+                {
+                    "type": "end",
+                    "iter": self._run_iteration + 1,
+                    "status": "success",
+                    "iterations": 0,
+                }
+            )
+            trace.close()
+            self._run_done.set()
+            configured_model = self._llm_runtime.configured_model
+            return {
+                "status": "success",
+                "run_dir": str(run_dir),
+                "run_id": run_dir.name,
+                "content": final_content,
+                "react_trace": [
+                    {
+                        "type": "session_swarm_reconciliation",
+                        "status": session_recovered_swarm_result.get("status"),
+                    }
+                ],
+                "iterations": 0,
+                "max_iterations": self.max_iterations,
+                "swarm_reconciliation": session_recovered_swarm_result,
+                "provider": self._llm_runtime.provider,
+                "configured_model": configured_model,
+                "model": configured_model,
+                "model_source": "configured",
+                "reasoning_effort": self._llm_runtime.reasoning_effort,
+            }
 
         iteration = 0
         final_content = ""
@@ -1978,6 +2269,20 @@ class AgentLoop:
                     "status": same_turn_swarm_reconciliation["reconciliation"].get("status"),
                 }
             )
+        elif session_recovered_swarm_result is not None:
+            # A fresh UI turn has no model-owned run context.  The recovery
+            # response must therefore come directly from the canonical result,
+            # rather than asking the model to restate a system message.
+            final_content = self._render_owned_swarm_terminal_response(
+                session_recovered_swarm_result
+            )
+            trace.write(
+                {
+                    "type": "session_swarm_reconciliation",
+                    "iter": self._run_iteration,
+                    "result": session_recovered_swarm_result,
+                }
+            )
 
         # Determine final status. The reason is also propagated into the
         # returned dict so SessionService can surface a meaningful UI
@@ -2576,7 +2881,7 @@ class AgentLoop:
             workflow_obligation = getattr(self, "_workflow_obligation", None)
             if workflow_obligation is not None:
                 workflow_obligation.mark_swarm_started()
-                invocation_args["__on_swarm_started"] = workflow_obligation.bind_swarm_run
+                invocation_args["__on_swarm_started"] = self._bind_started_swarm_run
                 invocation_args["__launch_id"] = workflow_obligation.obligation.launch_id
             invocation_args["__cancel_event"] = self._cancel_event
             if self._trusted_owner_session_id is not None:
