@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,62 @@ def test_strict_identity_snapshots_hash_on_capable_preset() -> None:
     assert run.identity_hash == identity.identity_hash
     assert run.provenance_validation_status == "pending"
     assert run.preset_capabilities is not None
+
+
+def test_strict_baseline_factor_noop_is_projected_out_of_backtest_and_report_dependencies() -> None:
+    """A contract-free advisory factor task must not block strict execution."""
+    run = build_run_from_preset(
+        "quant_scalp_desk",
+        {"goal": "test", "market": "forex"},
+        execution_identity=_verified_mt5_identity(),
+    )
+    tasks = {task.id: task for task in run.tasks}
+
+    assert "task-factor" not in tasks
+    assert tasks["task-backtest"].depends_on == ["task-screen"]
+    assert tasks["task-backtest"].input_from == {"screen_result": "task-screen"}
+    assert tasks["task-report"].depends_on == ["task-screen", "task-backtest", "task-risk"]
+    assert "factors" not in tasks["task-report"].input_from
+
+
+def test_non_strict_quant_scalp_dag_keeps_factor_dependencies() -> None:
+    """Projection is confined to the strict source-scoped baseline."""
+    run = build_run_from_preset("quant_scalp_desk", {"goal": "test", "market": "forex"})
+    tasks = {task.id: task for task in run.tasks}
+
+    assert tasks["task-backtest"].depends_on == ["task-screen", "task-factor"]
+    assert tasks["task-backtest"].input_from["factors"] == "task-factor"
+    assert "task-factor" in tasks["task-report"].depends_on
+    assert tasks["task-report"].input_from["factors"] == "task-factor"
+
+
+def test_strict_factor_with_declared_input_and_output_contract_remains_blocking(monkeypatch) -> None:
+    """A future typed factor path must retain its declared DAG authority."""
+    import src.swarm.presets as presets_module
+
+    source = presets_module.load_preset("quant_scalp_desk")
+    contracted = deepcopy(source)
+    factor = next(task for task in contracted["tasks"] if task["id"] == "task-factor")
+    factor["artifact_requirements"] = [
+        {"producer_task_id": "task-screen", "artifact_type": "market_data.snapshot"}
+    ]
+    report = next(task for task in contracted["tasks"] if task["id"] == "task-report")
+    report["artifact_requirements"].append(
+        {"producer_task_id": "task-factor", "artifact_type": "factor.result"}
+    )
+    monkeypatch.setattr(presets_module, "load_preset", lambda _name: deepcopy(contracted))
+
+    run = presets_module.build_run_from_preset(
+        "quant_scalp_desk",
+        {"goal": "test", "market": "forex"},
+        execution_identity=_verified_mt5_identity(),
+    )
+    tasks = {task.id: task for task in run.tasks}
+
+    assert "task-factor" in tasks["task-backtest"].depends_on
+    assert tasks["task-backtest"].input_from["factors"] == "task-factor"
+    assert "task-factor" in tasks["task-report"].depends_on
+    assert tasks["task-report"].input_from["factors"] == "task-factor"
 
 
 def test_verified_identity_market_overrides_incidental_usdt_goal() -> None:

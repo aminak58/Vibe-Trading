@@ -377,6 +377,59 @@ def inspect_preset(name: str) -> dict:
     }
 
 
+def _project_strict_baseline_factor_task(
+    preset_name: str,
+    tasks: list[SwarmTask],
+    identity: ExecutionIdentity | None,
+) -> list[SwarmTask]:
+    """Omit an uncontracted factor sidecar from the strict scalp baseline.
+
+    ``factor_analysis`` is intentionally unavailable in strict mode without
+    registered factor/forward-return input panels.  Until this preset declares
+    both those inputs and a typed output consumed downstream, its factor task
+    is advisory prose rather than quantitative evidence.  Keeping it in the
+    executable DAG would let a no-op sidecar block the official backtest.
+    """
+    if (
+        preset_name != "quant_scalp_desk"
+        or identity is None
+        or identity.mode is not ExecutionMode.SOURCE_SCOPED
+        or identity.policy.source_mode is not SourceMode.STRICT
+    ):
+        return tasks
+
+    factor_task = next((task for task in tasks if task.id == "task-factor"), None)
+    if factor_task is None:
+        return tasks
+
+    has_typed_input = any(requirement.required for requirement in factor_task.artifact_requirements)
+    has_typed_output = any(
+        requirement.required and requirement.producer_task_id == factor_task.id
+        for task in tasks
+        for requirement in task.artifact_requirements
+    )
+    if has_typed_input and has_typed_output:
+        return tasks
+
+    projected: list[SwarmTask] = []
+    for task in tasks:
+        if task.id == factor_task.id:
+            continue
+        depends_on = [dependency for dependency in task.depends_on if dependency != factor_task.id]
+        input_from = {
+            key: source_task_id
+            for key, source_task_id in task.input_from.items()
+            if source_task_id != factor_task.id
+        }
+        projected.append(task.model_copy(update={
+            "depends_on": depends_on,
+            "blocked_by": list(depends_on),
+            "input_from": input_from,
+            "status": TaskStatus.blocked if depends_on else TaskStatus.pending,
+        }))
+    return projected
+
+
 def build_run_from_preset(
     preset_name: str,
     user_vars: dict[str, str],
@@ -437,6 +490,8 @@ def build_run_from_preset(
             artifact_requirements=[ArtifactRequirement.model_validate(item) for item in task_data.get("artifact_requirements", [])],
             status=status,
         ))
+
+    tasks = _project_strict_baseline_factor_task(preset_name, tasks, execution_identity)
 
     # Generate run ID
     now = datetime.now(timezone.utc)
