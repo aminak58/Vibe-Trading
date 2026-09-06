@@ -962,6 +962,8 @@ class AgentLoop:
         self._called_identical: dict[tuple[str, str], str] = {}
         self._active_swarm_run_id: str | None = None
         self._active_swarm_identity_hash: str | None = None
+        self._active_swarm_launch_id: str | None = None
+        self._active_swarm_owner_session_id: str | None = None
         self._trusted_owner_session_id: str | None = None
 
     def cancel(self) -> None:
@@ -1042,8 +1044,14 @@ class AgentLoop:
         if payload.get("status") == "running":
             self._active_swarm_run_id = str(payload.get("run_id") or "") or None
             self._active_swarm_identity_hash = str(payload.get("identity_hash") or "") or None
+            self._active_swarm_launch_id = str(payload.get("launch_id") or "") or None
+            self._active_swarm_owner_session_id = (
+                str(payload.get("owner_session_id") or "") or None
+            )
 
-    def _persist_swarm_ownership(self, status: str) -> None:
+    def _persist_swarm_ownership(
+        self, status: str, *, terminal_reason: str | None = None
+    ) -> None:
         path = self._swarm_ownership_path()
         if path is None:
             return
@@ -1051,7 +1059,11 @@ class AgentLoop:
             "status": status,
             "run_id": self._active_swarm_run_id,
             "identity_hash": self._active_swarm_identity_hash,
+            "launch_id": self._active_swarm_launch_id,
+            "owner_session_id": self._active_swarm_owner_session_id,
         }
+        if terminal_reason is not None:
+            payload["terminal_reason"] = terminal_reason
         try:
             path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
         except OSError:
@@ -1072,6 +1084,11 @@ class AgentLoop:
             if self._execution_identity is not None
             else None
         )
+        obligation = getattr(self, "_workflow_obligation", None)
+        self._active_swarm_launch_id = (
+            getattr(obligation.obligation, "launch_id", None) if obligation is not None else None
+        )
+        self._active_swarm_owner_session_id = self._trusted_owner_session_id
         self._persist_swarm_ownership("running")
 
     def _clear_completed_swarm_ownership(self, result: str) -> None:
@@ -1081,10 +1098,17 @@ class AgentLoop:
             return
         if not isinstance(payload, dict) or payload.get("run_id") != self._active_swarm_run_id:
             return
-        if str(payload.get("status") or "") in {"completed", "failed", "cancelled"}:
-            self._persist_swarm_ownership("terminal")
+        status = str(payload.get("status") or "")
+        terminal_statuses = {"completed", "failed", "cancelled", "rejected"}
+        if status in terminal_statuses:
+            reason = str(payload.get("terminal_reason") or "") or None
+            if reason is None:
+                reason = f"owned_swarm_terminal_{'failure' if status == 'failed' else status}"
+            self._persist_swarm_ownership(status, terminal_reason=reason)
             self._active_swarm_run_id = None
             self._active_swarm_identity_hash = None
+            self._active_swarm_launch_id = None
+            self._active_swarm_owner_session_id = None
 
     def _reconcile_owned_swarm_from_store(self) -> dict[str, Any] | None:
         """Recover an owned Swarm terminal result from server-owned storage.
@@ -1094,22 +1118,67 @@ class AgentLoop:
         required-artifact checks; this adapter only loads the persisted Swarm
         aggregate root through its canonical store.
         """
-        obligation = getattr(self, "_workflow_obligation", None)
-        if obligation is None or not obligation.obligation.swarm_run_id:
-            return None
         from src.swarm.store import SwarmStore, swarm_runs_root
 
         store = SwarmStore(base_dir=swarm_runs_root())
-        run = store.load_run(obligation.obligation.swarm_run_id)
+        obligation = getattr(self, "_workflow_obligation", None)
+        obligation_run_id = (
+            obligation.obligation.swarm_run_id if obligation is not None else None
+        )
+        if obligation_run_id:
+            run = store.load_run(obligation_run_id)
+            if run is None:
+                return None
+            reconciled = store.reconcile_run(run, write=True)
+            result = obligation.reconcile_owned_swarm(
+                reconciled,
+                owner_session_id=getattr(self, "_trusted_owner_session_id", None),
+            )
+            if result is not None:
+                self._clear_completed_swarm_ownership(json.dumps(result))
+            return result
+
+        # Generic/AUTO runs do not create a WorkflowObligation, but an owned
+        # run may still have outlived its parent wait budget.  Reconcile only
+        # the exact persisted run/session/launch tuple; no lookup by broad
+        # status is permitted.
+        if not self._active_swarm_run_id:
+            return None
+        run = store.load_run(self._active_swarm_run_id)
         if run is None:
             return None
         reconciled = store.reconcile_run(run, write=True)
-        result = obligation.reconcile_owned_swarm(
-            reconciled,
-            owner_session_id=getattr(self, "_trusted_owner_session_id", None),
+        expected_session = (
+            self._active_swarm_owner_session_id or self._trusted_owner_session_id
         )
-        if result is not None:
-            self._clear_completed_swarm_ownership(json.dumps(result))
+        if not expected_session or reconciled.owner_session_id != expected_session:
+            return None
+        if reconciled.launch_id != self._active_swarm_launch_id:
+            return None
+        status = (
+            reconciled.status.value
+            if hasattr(reconciled.status, "value")
+            else str(reconciled.status)
+        )
+        if status not in {"completed", "failed", "cancelled", "rejected"}:
+            return None
+        result = {
+            "status": status,
+            "run_id": reconciled.id,
+            "terminal_reason": f"owned_swarm_terminal_{'failure' if status == 'failed' else status}",
+            "artifact_status": {
+                task.id: {
+                    "status": (
+                        task.status.value
+                        if hasattr(task.status, "value")
+                        else str(task.status)
+                    ),
+                    "artifact_count": len(task.artifact_refs),
+                }
+                for task in reconciled.tasks
+            },
+        }
+        self._clear_completed_swarm_ownership(json.dumps(result))
         return result
 
     def _swarm_ownership_block(self, tool_name: str) -> str | None:
@@ -1160,6 +1229,8 @@ class AgentLoop:
         self._called_identical = {}
         self._active_swarm_run_id = None
         self._active_swarm_identity_hash = None
+        self._active_swarm_launch_id = None
+        self._active_swarm_owner_session_id = None
         self._trusted_owner_session_id = session_id if isinstance(session_id, str) and session_id else None
         run_started_wall = _time.time()
 
