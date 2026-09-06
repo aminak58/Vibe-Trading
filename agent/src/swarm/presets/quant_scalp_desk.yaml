@@ -124,7 +124,7 @@ agents:
       {context} — final level.
 
       ## Required outputs
-      1. **Final strategy** — full trading rules with MTF logic
+      1. **Executed strategy context** — discuss only the server-supplied executed rules; the runtime renders the Final Strategy section
       2. **Backtest summary** — metrics for the contract-resolved instrument only
       3. **Risk summary** — cost sensitivity + verdict (edge plausible / not shown / no)
       4. **Data Access Limitations** — list every tool that errored, with exact error text
@@ -132,6 +132,8 @@ agents:
       6. **Honest conclusion** — YES/NO/UNKNOWN for the contract-resolved instrument; no marketing.
 
       Do not invent numbers.
+      In this strict desk, do not write a "Final Strategy" heading yourself.
+      The runtime publishes that section only from the executed strategy/config/run-card artifacts. Your report must contain analysis, metrics, risk, and limitations only.
     tools: [bash, read_file, write_file, load_skill, read_dependency_artifact]
     skills: [report-generate]
     max_iterations: 60
@@ -182,6 +184,8 @@ tasks:
     artifact_requirements:
       - {producer_task_id: task-backtest, artifact_type: backtest.execution_provenance}
       - {producer_task_id: task-backtest, artifact_type: backtest.config}
+      - {producer_task_id: task-backtest, artifact_type: backtest.run_card}
+      - {producer_task_id: task-backtest, artifact_type: backtest.strategy}
       - {producer_task_id: task-backtest, artifact_type: backtest.metrics}
       - {producer_task_id: task-risk, artifact_type: risk.audit_report}
 

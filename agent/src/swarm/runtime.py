@@ -55,6 +55,11 @@ from src.tools.mcp import invalidate_mcp_specs_cache
 from src.tools.redaction import redact_internal_paths
 from src.swarm.worker import agent_artifact_dir, clear_agent_artifacts, run_worker
 from src.swarm.artifacts import current_artifact_manifest, finalize_artifact_generation, register_task_artifacts, verify_registered_artifact
+from src.swarm.report_binding import (
+    NarrativeMismatch,
+    build_executed_strategy_binding,
+    render_bound_strict_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,7 @@ _STRICT_BACKTEST_ARTIFACTS = {
     "equity.csv": "backtest.equity",
     "trades.csv": "backtest.trades",
     "run_card.json": "backtest.run_card",
+    "signal_engine.py": "backtest.strategy",
 }
 
 
@@ -96,6 +102,28 @@ def _classify_authoritative_artifacts(run: SwarmRun, task: SwarmTask, refs: list
             "provenance_status": "passed" if artifact_type.startswith("backtest.") else "unclassified",
         }))
     return classified
+
+
+def _is_strict_report_task(run: SwarmRun, task: SwarmTask) -> bool:
+    """Return whether the server must construct this report's strategy section."""
+    identity = run.execution_identity
+    return bool(
+        run.preset_name == "quant_scalp_desk"
+        and task.id == "task-report"
+        and identity is not None
+        and getattr(getattr(identity, "mode", None), "value", None) == "source_scoped"
+        and getattr(getattr(getattr(identity, "policy", None), "source_mode", None), "value", None) == "strict"
+    )
+
+
+def _strict_report_binding(run: SwarmRun, task_store: TaskStore, run_dir: Path) -> dict[str, str]:
+    backtest = task_store.load_task("task-backtest")
+    return build_executed_strategy_binding(
+        run_dir=run_dir,
+        refs=list(backtest.artifact_refs),
+        run_id=run.id,
+        identity_hash=run.identity_hash or "",
+    )
 
 
 def _worker_retry_delay_ceiling_s(retry_number: int) -> float:
@@ -581,10 +609,23 @@ class SwarmRuntime:
                     run.total_input_tokens += result.input_tokens
                     run.total_output_tokens += result.output_tokens
 
+                    task = task_store.load_task(tid)
+                    if result.status == "completed" and _is_strict_report_task(run, task):
+                        try:
+                            result = result.model_copy(update={
+                                "summary": render_bound_strict_report(
+                                    _strict_report_binding(run, task_store, run_dir), result.summary
+                                )
+                            })
+                        except (NarrativeMismatch, ValueError) as exc:
+                            result = result.model_copy(update={
+                                "status": WorkerStatus.failed,
+                                "error": "narrative_mismatch: " + str(exc),
+                            })
+
                     if result.status == "completed":
                         task_summaries[tid] = result.summary
                         now_iso = datetime.now(timezone.utc).isoformat()
-                        task = task_store.load_task(tid)
                         artifact_refs = register_task_artifacts(
                             run_dir=run_dir,
                             task_id=tid,
@@ -1147,6 +1188,22 @@ class SwarmRuntime:
                     ))
                     continue
 
+                strict_binding: dict[str, str] | None = None
+                if _is_strict_report_task(run, task):
+                    try:
+                        strict_binding = _strict_report_binding(run, task_store, run_dir)
+                    except ValueError as exc:
+                        task_store.update_status(
+                            tid, TaskStatus.blocked,
+                            error="narrative_mismatch: " + str(exc),
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        self._emit_event(run.id, self._make_event(
+                            "task_blocked", agent_id=task.agent_id, task_id=tid,
+                            data={"reason_code": "narrative_mismatch", "run_id": run.id},
+                        ))
+                        continue
+
                 agent_spec = agent_map.get(task.agent_id)
                 if agent_spec is None:
                     results[tid] = WorkerResult(
@@ -1182,6 +1239,12 @@ class SwarmRuntime:
                         # completed dependency that is not named here never
                         # becomes visible to this worker.
                         upstream_artifacts[context_key] = list(source_task.artifact_refs)
+                if strict_binding is not None:
+                    upstream["executed_strategy_binding"] = (
+                        "SERVER-OWNED EXECUTED STRATEGY BINDING (do not replace it):\n"
+                        + json.dumps(strict_binding, ensure_ascii=False, sort_keys=True)
+                        + "\nDo not emit a 'Final Strategy' heading; the runtime emits that section."
+                    )
 
                 future = executor.submit(
                     self._run_worker_with_retries,
