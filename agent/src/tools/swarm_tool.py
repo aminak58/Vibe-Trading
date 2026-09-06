@@ -343,7 +343,7 @@ _PRESET_KEYWORDS: list[tuple[str, list[str], float]] = [
 # Market labels used in YAML templates (English, compatible with {market} placeholders).
 _MARKET_PATTERNS: list[tuple[str, list[str]]] = [
     ("A-shares", [r"A股", r"a股", "沪深", "上证", "深证", "创业板", "科创板", "中证", r"\bCSI\b"]),
-    ("crypto", ["加密", r"\bcrypto\b", r"\bBTC\b", r"\bETH\b", "币", "USDT", "数字货币"]),
+    ("crypto", ["加密", r"\bcrypto\b", r"\bBTC\b", r"\bETH\b", r"\bOKX\b", "币", "USDT", "数字货币"]),
     ("Hong Kong", ["港股", "恒生", r"H股", "港交所", r"\.HK\b"]),
     ("US", ["美股", "纳斯达克", "标普", "道琼斯", r"S&P", r"\.US\b"]),
 ]
@@ -495,6 +495,25 @@ def _resolve_preset(prompt: str, explicit_preset: str | None = None) -> tuple[st
     return _match_preset(prompt), None
 
 
+def _is_negated_market_match(prompt: str, match: re.Match[str]) -> bool:
+    """Whether one market keyword appears only as a local prohibition.
+
+    This deliberately is not natural-language inference: it examines a small
+    deterministic window around a keyword for explicit English/Persian
+    prohibition grammar.  A positive keyword elsewhere in the prompt remains
+    usable market evidence.
+    """
+    before = prompt[max(0, match.start() - 56):match.start()]
+    after = prompt[match.end():match.end() + 80]
+    if re.search(r"\b(?:do\s+not|don't|no|avoid|not|without)\b", before, re.IGNORECASE):
+        return True
+    if re.search(r"\b(?:forbidden|not\s+allowed|prohibited)\b", after, re.IGNORECASE):
+        return True
+    if "\u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0646\u06a9\u0646" in after or "\u0645\u062c\u0627\u0632 \u0646\u06cc\u0633\u062a" in after or "\u0645\u0645\u0646\u0648\u0639" in after:
+        return True
+    return "\u0646\u0647" in before[-16:]
+
+
 def _extract_market(prompt: str) -> str:
     """Extract target market label from prompt.
 
@@ -506,7 +525,10 @@ def _extract_market(prompt: str) -> str:
     """
     for market, patterns in _MARKET_PATTERNS:
         for pat in patterns:
-            if re.search(pat, prompt, re.IGNORECASE):
+            if any(
+                not _is_negated_market_match(prompt, match)
+                for match in re.finditer(pat, prompt, re.IGNORECASE)
+            ):
                 return market
     return "A-shares"
 
