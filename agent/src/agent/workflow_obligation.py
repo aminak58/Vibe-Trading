@@ -244,6 +244,92 @@ class WorkflowObligationLedger:
             self._obligation = self._obligation.transition(terminal[status])
             self.persist()
 
+    def reconcile_owned_swarm(
+        self,
+        run: Any,
+        *,
+        owner_session_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Reconcile a waiting obligation from one owned, persisted Swarm run.
+
+        This is deliberately a server-side read of the Swarm aggregate root;
+        worker summaries and parent-model prose never participate.  A caller
+        must load and reconcile ``run`` through :class:`SwarmStore` first.
+        ``None`` means the supplied run is not the one this obligation owns.
+        """
+        obligation = self._obligation
+        if (
+            obligation.mode is not WorkflowMode.SWARM_REQUIRED
+            or obligation.status not in {WorkflowStatus.SWARM_STARTED, WorkflowStatus.WAITING}
+            or not obligation.swarm_run_id
+            or getattr(run, "id", None) != obligation.swarm_run_id
+            or getattr(run, "launch_id", None) != obligation.launch_id
+            or (owner_session_id is not None and getattr(run, "owner_session_id", None) != owner_session_id)
+        ):
+            return None
+
+        status = str(getattr(getattr(run, "status", None), "value", "")).casefold()
+        if status in {"failed", "rejected"}:
+            self._obligation = obligation.transition(
+                WorkflowStatus.FAILED,
+                terminal_result_status=status,
+                terminal_reason="owned_swarm_terminal_failure",
+            )
+            self.persist()
+            return {"status": "failed", "run_id": obligation.swarm_run_id}
+        if status in {"cancelled", "canceled"}:
+            self._obligation = obligation.transition(
+                WorkflowStatus.CANCELLED,
+                terminal_result_status="cancelled",
+                terminal_reason="owned_swarm_cancelled",
+            )
+            self.persist()
+            return {"status": "cancelled", "run_id": obligation.swarm_run_id}
+        if status != "completed":
+            return None
+
+        artifact_refs = [
+            ref
+            for task in getattr(run, "tasks", [])
+            for ref in getattr(task, "artifact_refs", [])
+            if getattr(ref, "producer_run_id", None) == obligation.swarm_run_id
+            and getattr(ref, "execution_identity_hash", None) == obligation.identity_hash
+            and getattr(ref, "provenance_status", None) == "passed"
+        ]
+        required_types = {"backtest.metrics", "backtest.trades", "backtest.equity"}
+        present_types = {str(getattr(ref, "artifact_type", "")) for ref in artifact_refs}
+        missing = sorted(required_types - present_types)
+        provenance = str(getattr(run, "provenance_validation_status", "")).casefold()
+        if provenance != "passed" or missing:
+            self._obligation = obligation.transition(
+                WorkflowStatus.FAILED,
+                terminal_result_status="completed_with_artifact_gap",
+                terminal_reason="completed_with_artifact_gap",
+            )
+            self.persist()
+            return {
+                "status": "completed_with_artifact_gap",
+                "run_id": obligation.swarm_run_id,
+                "missing_artifact_types": missing,
+                "provenance_validation_status": provenance or "not_required",
+            }
+
+        artifact_ids = sorted(str(getattr(ref, "artifact_id")) for ref in artifact_refs)
+        self._obligation = obligation.transition(
+            WorkflowStatus.COMPLETED,
+            terminal_result_status="completed",
+            terminal_reason="official_swarm_result",
+        )
+        self.persist()
+        return {
+            "status": "completed",
+            "run_id": obligation.swarm_run_id,
+            "preset": getattr(run, "preset_name", None),
+            "provenance_validation_status": provenance,
+            "artifact_ids": artifact_ids,
+            "final_report": str(getattr(run, "final_report", "") or ""),
+        }
+
     def prepare_run_swarm(self, arguments: dict[str, Any], identity: Any | None) -> str | None:
         """Resolve a bounded capability requirement into one server-selected preset.
 

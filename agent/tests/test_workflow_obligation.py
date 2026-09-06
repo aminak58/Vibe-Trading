@@ -30,6 +30,7 @@ from src.agent.workflow_obligation import (
     obligation_from_current_user_message,
 )
 from src.swarm.presets import resolve_source_scoped_preset
+from src.swarm.models import ArtifactRef, RunStatus, SwarmRun
 
 
 def _verified_mt5_identity() -> ExecutionIdentity:
@@ -296,3 +297,121 @@ def test_loop_blocks_direct_backtest_before_tool_dispatch(tmp_path: Path) -> Non
     trace.close()
     assert tool.calls == 0
     assert any("denied_by_orchestration_intent" in message["content"] for message in messages)
+
+
+def _official_terminal_run(*, run_id: str = "swarm-20260906-045503-2373cf2c", status: RunStatus = RunStatus.completed,
+                           provenance: str = "passed", session_id: str = "session-1", launch_id: str = "launch-1",
+                           artifact_types: tuple[str, ...] = (
+                               "backtest.metrics", "backtest.trades", "backtest.equity",
+                           )) -> SwarmRun:
+    refs = [
+        ArtifactRef(
+            artifact_id=f"artifact-{artifact_type}",
+            producer_run_id=run_id,
+            producer_task_id="task-backtest",
+            producer_agent_id="backtester",
+            run_relative_path=f"artifacts/backtester/{artifact_type}.json",
+            sha256="a" * 64,
+            byte_size=1,
+            execution_identity_hash="identity-1",
+            artifact_type=artifact_type,
+            provenance_status="passed",
+        )
+        for artifact_type in artifact_types
+    ]
+    from src.swarm.models import SwarmTask
+    return SwarmRun(
+        id=run_id,
+        preset_name="quant_scalp_desk",
+        status=status,
+        created_at="2026-09-06T04:55:03+00:00",
+        completed_at="2026-09-06T05:20:18+00:00" if status is RunStatus.completed else None,
+        final_report="official final report" if status is RunStatus.completed else None,
+        owner_session_id=session_id,
+        launch_id=launch_id,
+        identity_hash="identity-1",
+        provenance_validation_status=provenance,
+        tasks=[SwarmTask(id="task-backtest", agent_id="backtester", prompt_template="x", artifact_refs=refs)],
+    )
+
+
+def _waiting_owned_ledger(tmp_path: Path) -> WorkflowObligationLedger:
+    ledger = WorkflowObligationLedger(run_dir=tmp_path, user_message="Run Swarm")
+    ledger.bind_identity("identity-1")
+    ledger.mark_swarm_started()
+    ledger.bind_swarm_run("swarm-20260906-045503-2373cf2c")
+    ledger._obligation = ledger.obligation.transition(WorkflowStatus.WAITING, launch_id="launch-1")
+    ledger.persist()
+    return ledger
+
+
+def test_waiting_owned_completed_swarm_reconciles_from_official_artifacts(tmp_path: Path) -> None:
+    ledger = _waiting_owned_ledger(tmp_path)
+    result = ledger.reconcile_owned_swarm(_official_terminal_run(), owner_session_id="session-1")
+    assert result is not None
+    assert result["status"] == "completed"
+    assert result["final_report"] == "official final report"
+    assert set(result["artifact_ids"]) == {
+        "artifact-backtest.metrics", "artifact-backtest.trades", "artifact-backtest.equity",
+    }
+    assert ledger.obligation.status is WorkflowStatus.COMPLETED
+    assert ledger.obligation.dispatch_attempted is True
+    assert ledger.block("run_swarm", {}) is not None
+
+
+def test_completed_owned_swarm_with_missing_official_artifacts_is_terminal_gap(tmp_path: Path) -> None:
+    ledger = _waiting_owned_ledger(tmp_path)
+    result = ledger.reconcile_owned_swarm(
+        _official_terminal_run(artifact_types=("backtest.metrics",)), owner_session_id="session-1"
+    )
+    assert result is not None
+    assert result["status"] == "completed_with_artifact_gap"
+    assert result["missing_artifact_types"] == ["backtest.equity", "backtest.trades"]
+    assert ledger.obligation.status is WorkflowStatus.FAILED
+    assert ledger.obligation.terminal_reason == "completed_with_artifact_gap"
+
+
+def test_late_terminal_failure_reconciles_actual_swarm_state(tmp_path: Path) -> None:
+    ledger = _waiting_owned_ledger(tmp_path)
+    result = ledger.reconcile_owned_swarm(
+        _official_terminal_run(status=RunStatus.failed), owner_session_id="session-1"
+    )
+    assert result == {"status": "failed", "run_id": "swarm-20260906-045503-2373cf2c"}
+    assert ledger.obligation.status is WorkflowStatus.FAILED
+
+
+def test_terminal_run_with_mismatched_ownership_cannot_reconcile_obligation(tmp_path: Path) -> None:
+    ledger = _waiting_owned_ledger(tmp_path)
+    result = ledger.reconcile_owned_swarm(_official_terminal_run(launch_id="other-launch"), owner_session_id="session-1")
+    assert result is None
+    assert ledger.obligation.status is WorkflowStatus.WAITING
+
+
+def test_terminal_run_with_mismatched_session_cannot_reconcile_obligation(tmp_path: Path) -> None:
+    ledger = _waiting_owned_ledger(tmp_path)
+    result = ledger.reconcile_owned_swarm(_official_terminal_run(), owner_session_id="other-session")
+    assert result is None
+    assert ledger.obligation.status is WorkflowStatus.WAITING
+
+
+def test_loop_recovers_late_owned_swarm_completion_from_persisted_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.swarm.store import SwarmStore
+
+    ledger = _waiting_owned_ledger(tmp_path / "parent")
+    store = SwarmStore(tmp_path / "swarm-runs")
+    store.create_run(_official_terminal_run())
+    agent = AgentLoop(
+        registry=ToolRegistry(), llm=SimpleNamespace(), memory=WorkspaceMemory(run_dir=str(tmp_path / "parent"))
+    )
+    agent._workflow_obligation = ledger
+    agent._trusted_owner_session_id = "session-1"
+    monkeypatch.setattr("src.swarm.store.swarm_runs_root", lambda: tmp_path / "swarm-runs")
+
+    result = agent._reconcile_owned_swarm_from_store()
+
+    assert result is not None
+    assert result["status"] == "completed"
+    assert result["final_report"] == "official final report"
+    assert ledger.obligation.status is WorkflowStatus.COMPLETED

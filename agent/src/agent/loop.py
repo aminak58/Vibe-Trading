@@ -1086,6 +1086,32 @@ class AgentLoop:
             self._active_swarm_run_id = None
             self._active_swarm_identity_hash = None
 
+    def _reconcile_owned_swarm_from_store(self) -> dict[str, Any] | None:
+        """Recover an owned Swarm terminal result from server-owned storage.
+
+        This is intentionally read/repair-only: it neither dispatches nor
+        retries a Swarm.  The ledger performs the ownership, provenance, and
+        required-artifact checks; this adapter only loads the persisted Swarm
+        aggregate root through its canonical store.
+        """
+        obligation = getattr(self, "_workflow_obligation", None)
+        if obligation is None or not obligation.obligation.swarm_run_id:
+            return None
+        from src.swarm.store import SwarmStore, swarm_runs_root
+
+        store = SwarmStore(base_dir=swarm_runs_root())
+        run = store.load_run(obligation.obligation.swarm_run_id)
+        if run is None:
+            return None
+        reconciled = store.reconcile_run(run, write=True)
+        result = obligation.reconcile_owned_swarm(
+            reconciled,
+            owner_session_id=getattr(self, "_trusted_owner_session_id", None),
+        )
+        if result is not None:
+            self._clear_completed_swarm_ownership(json.dumps(result))
+        return result
+
     def _swarm_ownership_block(self, tool_name: str) -> str | None:
         if self._active_swarm_run_id is None:
             return None
@@ -1159,6 +1185,10 @@ class AgentLoop:
             run_dir=run_dir,
             user_message=user_message,
         )
+        # A prior wait budget may have elapsed while the owned Swarm continued
+        # in the background.  Reconcile its persisted terminal state before
+        # the parent can plan a new turn; this performs no dispatch or retry.
+        reconciled_swarm_result = self._reconcile_owned_swarm_from_store()
         self._grounding = GroundingLedger(
             run_dir=run_dir,
             user_message=user_message,
@@ -1178,6 +1208,19 @@ class AgentLoop:
         goal_store = None
         goal_turn_accounted = False
         messages = context.build_messages(llm_user_message, history)
+        if reconciled_swarm_result is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "<server-owned-swarm-reconciliation>\n"
+                        + json.dumps(reconciled_swarm_result, ensure_ascii=False, sort_keys=True)
+                        + "\n</server-owned-swarm-reconciliation>\n"
+                        "Use this authoritative terminal result when responding. "
+                        "Do not dispatch, retry, or substitute a workflow."
+                    ),
+                }
+            )
         react_trace: List[Dict[str, Any]] = []
 
         trace_dir = SESSIONS_DIR / session_id if session_id else run_dir
@@ -1881,6 +1924,8 @@ class AgentLoop:
             "iterations": iteration,
             "max_iterations": self.max_iterations,
         }
+        if reconciled_swarm_result is not None:
+            result["swarm_reconciliation"] = reconciled_swarm_result
         if self._released_fallback:
             result["degraded"] = True
         configured_model = self._llm_runtime.configured_model
