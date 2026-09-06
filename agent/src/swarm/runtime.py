@@ -75,6 +75,39 @@ _STRICT_BACKTEST_ARTIFACTS = {
 }
 
 
+def _canonical_executed_strategy_path(refs: list[ArtifactRef], run_dir: Path) -> str | None:
+    """Return the one strategy path named by the executed run card.
+
+    A worker may retain convenience copies of ``signal_engine.py`` beside its
+    actual executed file.  Basename classification cannot distinguish those
+    copies.  The backtest's server-written run card records the executed
+    artifact path and reproducibility hash, so it is the sole authority for
+    this strict classification decision.
+    """
+    run_cards = [ref for ref in refs if Path(ref.run_relative_path).name == "run_card.json"]
+    if len(run_cards) != 1:
+        return None
+    run_card_ref = run_cards[0]
+    try:
+        payload = json.loads((run_dir / run_card_ref.run_relative_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    reproducibility = payload.get("reproducibility") if isinstance(payload, dict) else None
+    strategy_hash = reproducibility.get("strategy_hash") if isinstance(reproducibility, dict) else None
+    artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+    if not isinstance(strategy_hash, str) or not isinstance(artifacts, list):
+        return None
+    paths = {
+        (Path(run_card_ref.run_relative_path).parent / str(item.get("path"))).as_posix()
+        for item in artifacts
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and item.get("sha256") == strategy_hash
+        and str(item.get("path")).endswith(".py")
+    }
+    return next(iter(paths)) if len(paths) == 1 else None
+
+
 def _classify_authoritative_artifacts(run: SwarmRun, task: SwarmTask, refs: list[ArtifactRef], run_dir: Path) -> list[ArtifactRef]:
     """Classify strict quantitative evidence only from a verified producer bundle.
 
@@ -94,9 +127,15 @@ def _classify_authoritative_artifacts(run: SwarmRun, task: SwarmTask, refs: list
     validation = validate_execution_provenance(run.execution_identity, payload, owning_run_id=run.id)
     if not validation.valid:
         return refs
+    canonical_strategy_path = _canonical_executed_strategy_path(refs, run_dir)
     classified: list[ArtifactRef] = []
     for ref in refs:
         artifact_type = _STRICT_BACKTEST_ARTIFACTS.get(Path(ref.run_relative_path).name, "worker.file")
+        if (
+            artifact_type == "backtest.strategy"
+            and Path(ref.run_relative_path).as_posix() != canonical_strategy_path
+        ):
+            artifact_type = "worker.file"
         classified.append(ref.model_copy(update={
             "artifact_type": artifact_type,
             "provenance_status": "passed" if artifact_type.startswith("backtest.") else "unclassified",
