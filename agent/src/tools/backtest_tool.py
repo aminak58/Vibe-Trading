@@ -89,6 +89,7 @@ def run_backtest(
     *,
     execution_identity: ExecutionIdentity | None = None,
     owning_run_id: str | None = None,
+    window_authority: dict | None = None,
 ) -> str:
     """Run backtest: validate config.json + signal_engine.py, invoke built-in engine.
 
@@ -190,6 +191,25 @@ def run_backtest(
         cli_args=[str(run_path)],
     )
 
+    # The engine writes run_card.json inside the generated-strategy process.
+    # Add research-window authority only after that process ends, using an
+    # internal value supplied by the trusted parent.  Config content or a
+    # matching config hash is never treated as authority.
+    if window_authority is not None:
+        try:
+            from backtest.research_window import (
+                finalize_research_window_metadata,
+                persist_server_window_authority,
+            )
+
+            persist_server_window_authority(run_path, window_authority)
+            finalize_research_window_metadata(run_path, window_authority)
+        except OSError:
+            # The engine's legacy card remains readable and consequently has
+            # unknown authority; do not turn a mechanical execution into a
+            # false research conclusion because a post-run audit write failed.
+            pass
+
     emit_progress("finalize", message="collecting artifacts")
     artifacts_found = {name: str(path) for name, path in result.artifacts.items()}
     response = {
@@ -227,4 +247,5 @@ class BacktestTool(BaseTool):
             kwargs["run_dir"],
             execution_identity=kwargs.get("__execution_identity"),
             owning_run_id=kwargs.get("__swarm_run_id"),
+            window_authority=kwargs.get("__window_authority"),
         )

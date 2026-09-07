@@ -645,6 +645,7 @@ class SwarmRuntime:
         execution_identity: ExecutionIdentity | None = None,
         owner_session_id: str | None = None,
         launch_id: str | None = None,
+        window_authority: dict[str, Any] | None = None,
     ) -> SwarmRun:
         """Start a swarm run. Returns immediately, execution happens in background.
 
@@ -685,6 +686,8 @@ class SwarmRuntime:
         )
         if launch_id:
             run = run.model_copy(update={"launch_id": launch_id})
+        if window_authority is not None:
+            run = run.model_copy(update={"window_authority": dict(window_authority)})
         validate_dag(run.tasks)
 
         # Capture which provider/model the run was launched against so the
@@ -1610,6 +1613,7 @@ class SwarmRuntime:
                     grounding_block=grounding_block,
                     cancel_event=cancel_event,
                     execution_identity=run.execution_identity,
+                    window_authority=run.window_authority,
                 )
                 futures[future] = tid
                 per_task_budget = (
@@ -1674,6 +1678,7 @@ class SwarmRuntime:
         cancel_event: threading.Event | None = None,
         execution_identity: ExecutionIdentity | None = None,
         upstream_artifacts: dict[str, list[ArtifactRef]] | None = None,
+        window_authority: dict[str, Any] | None = None,
     ) -> WorkerResult:
         """Run a worker with automatic retry on failure.
 
@@ -1761,6 +1766,7 @@ class SwarmRuntime:
                 agent_config=self._agent_config,
                 cancel_event=cancel_event,
                 execution_identity=execution_identity,
+                window_authority=window_authority,
             )
 
             cumulative_input_tokens += result.input_tokens

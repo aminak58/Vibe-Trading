@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from src.swarm.artifacts import current_artifact_manifest, verify_registered_artifact
 from src.swarm.models import ArtifactRef
+from backtest.research_window import build_research_window_metadata
 
 
 _REQUIRED_ARTIFACT_TYPES = frozenset(
@@ -26,6 +27,13 @@ _REQUIRED_ARTIFACT_TYPES = frozenset(
     }
 )
 _FINAL_STRATEGY_HEADING = re.compile(r"(?im)^#{1,6}\s*final\s+strategy\b")
+_UNSUPPORTED_HISTORY_DEPTH_CLAIM = re.compile(
+    r"(?i)\b(?:m5|mt5|broker)\s+(?:history\s+)?depth\s+"
+    r"(?:defines?|limits?|limited|caused)\s+(?:the\s+)?window\b"
+    r"|(?:عمق\s*(?:تاریخچه\s*)?(?:m5|mt5|متاتریدر|۵\s*دقیقه)|"
+    r"(?:m5|mt5|متاتریدر|۵\s*دقیقه)\s*(?:history|تاریخچه))"
+    r".{0,80}(?:پنجره|محدود)",
+)
 
 
 class NarrativeMismatch(ValueError):
@@ -99,7 +107,7 @@ def _strategy_docstring(run_dir: Path, ref: ArtifactRef) -> str:
 
 def validate_executed_strategy_artifact_contents(
     *, run_dir: Path, official: Mapping[str, ArtifactRef], identity_hash: str
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Validate and render fields from already-authorized executed artifacts.
 
     The runtime's strict task-output gate uses this after it has independently
@@ -127,6 +135,14 @@ def validate_executed_strategy_artifact_contents(
     interval = config.get("interval")
     if not isinstance(source, str) or not isinstance(interval, str):
         raise ValueError("invalid executed artifact: backtest.config")
+    research_window = run_card.get("research_window")
+    if not isinstance(research_window, Mapping):
+        # Legacy cards have no authority metadata.  Treat that omission as
+        # unknown; never upgrade it from config contents or matching hashes.
+        research_window = build_research_window_metadata(
+            config,
+            run_card.get("metrics") if isinstance(run_card.get("metrics"), Mapping) else {},
+        )
     return {
         "symbol": codes[0],
         "source": source,
@@ -135,12 +151,13 @@ def validate_executed_strategy_artifact_contents(
         "config_sha256": official["backtest.config"].sha256,
         "strategy_sha256": official["backtest.strategy"].sha256,
         "strategy_logic": _strategy_docstring(run_dir, official["backtest.strategy"]),
+        "research_window": dict(research_window),
     }
 
 
 def build_executed_strategy_binding(
     *, run_dir: Path, refs: list[ArtifactRef], run_id: str, identity_hash: str
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Return canonical report fields from hash-verified executed artifacts."""
     official = _official_refs(
         run_dir=run_dir, refs=refs, run_id=run_id, identity_hash=identity_hash
@@ -150,7 +167,7 @@ def build_executed_strategy_binding(
     )
 
 
-def render_bound_strict_report(binding: dict[str, str], worker_report: str) -> str:
+def render_bound_strict_report(binding: Mapping[str, Any], worker_report: str) -> str:
     """Prefix analysis with the immutable executed strategy section.
 
     A strict worker must not provide a second, free-form Final Strategy
@@ -158,6 +175,20 @@ def render_bound_strict_report(binding: dict[str, str], worker_report: str) -> s
     """
     if _FINAL_STRATEGY_HEADING.search(worker_report or ""):
         raise NarrativeMismatch("worker report attempted to replace Final Strategy")
+    research_window = binding.get("research_window")
+    research_window = research_window if isinstance(research_window, Mapping) else {}
+    coverage_probe = research_window.get("coverage_probe")
+    coverage_probe = coverage_probe if isinstance(coverage_probe, Mapping) else {}
+    if (
+        coverage_probe.get("status") != "performed"
+        and _UNSUPPORTED_HISTORY_DEPTH_CLAIM.search(worker_report or "")
+    ):
+        raise NarrativeMismatch("unsupported history-depth claim without coverage probe")
+    sufficiency = research_window.get("research_sufficiency")
+    sufficiency = sufficiency if isinstance(sufficiency, Mapping) else {}
+    authority = research_window.get("window_authority")
+    authority = authority if isinstance(authority, Mapping) else {}
+    conclusion = str(research_window.get("official_conclusion") or "EDGE NOT SHOWN ON LIMITED BASELINE")
     return (
         "## Final Strategy (Executed Contract)\n\n"
         f"- Resolved symbol: `{binding['symbol']}`\n"
@@ -168,6 +199,11 @@ def render_bound_strict_report(binding: dict[str, str], worker_report: str) -> s
         f"- Strategy SHA-256: `{binding['strategy_sha256']}`\n\n"
         "### Executed Strategy Logic\n\n"
         + binding["strategy_logic"]
+        + "\n\n## Research Sufficiency (Server-Generated)\n\n"
+        + f"- Window authority: `{authority.get('source', 'unknown')}`\n"
+        + f"- Coverage probe: `{coverage_probe.get('status', 'not_performed')}`\n"
+        + f"- Research sufficiency: `{sufficiency.get('status', 'unknown_not_enforced')}`\n"
+        + f"- Official conclusion: **{conclusion}**\n"
         + "\n\n## Research Report\n\n"
         + (worker_report or "")
     )

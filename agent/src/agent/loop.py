@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from src.agent.context import ContextBuilder
 from src.agent.grounding import GroundingLedger
 from src.agent.execution_identity_state import ExecutionIdentityLedger
+from src.agent.current_user_intent import window_authority_from_current_user_message
 from src.agent.workflow_obligation import WorkflowMode, WorkflowObligationLedger
 from src.agent.memory import WorkspaceMemory
 from src.agent.progress import HeartbeatTimer, ProgressEvent, _set_emitter
@@ -965,6 +966,7 @@ class AgentLoop:
         self._active_swarm_launch_id: str | None = None
         self._active_swarm_owner_session_id: str | None = None
         self._trusted_owner_session_id: str | None = None
+        self._window_authority: dict[str, Any] | None = None
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1547,6 +1549,12 @@ class AgentLoop:
         self._restore_swarm_ownership(run_dir)
 
         state_store.save_request(run_dir, user_message, {"session_id": session_id})
+        # Derived only from the raw current request and passed through internal
+        # tool arguments.  Neither model prose nor config.json can set it.
+        self._window_authority = window_authority_from_current_user_message(
+            user_message,
+            evidence_ref=f"run:{run_dir.name}/req.json",
+        )
         self._execution_identity = ExecutionIdentityLedger(
             run_dir=run_dir,
             user_message=user_message,
@@ -2915,6 +2923,8 @@ class AgentLoop:
             # This value is deliberately not part of the model-facing tool
             # schema. The server owns the current identity snapshot.
             invocation_args["__execution_identity"] = self._execution_identity.snapshot()
+        if tool_name in {"run_swarm", "backtest"} and self._window_authority is not None:
+            invocation_args["__window_authority"] = dict(self._window_authority)
         timed_out = threading.Event()
 
         def _on_progress(event: ProgressEvent) -> None:

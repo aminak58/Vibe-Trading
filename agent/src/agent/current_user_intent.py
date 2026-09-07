@@ -7,6 +7,8 @@ phrases.  It does not inspect memory, assembled context, or model prose.
 from __future__ import annotations
 
 import re
+from datetime import date
+from typing import Any
 
 
 _EXPLICIT_SOURCE_RE = re.compile(r"\bsource\s*(?:=|:)\s*['\"]?([a-z0-9_-]+)", re.IGNORECASE)
@@ -17,6 +19,7 @@ _PERSIAN_MT5_SOURCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 
 def explicit_source_from_current_user_message(user_message: str) -> str | None:
@@ -34,3 +37,33 @@ def explicit_source_from_current_user_message(user_message: str) -> str | None:
     if _PERSIAN_MT5_SOURCE_RE.search(text):
         return "mt5"
     return None
+
+
+def window_authority_from_current_user_message(
+    user_message: str, *, evidence_ref: str
+) -> dict[str, Any]:
+    """Return server-owned authority only for two explicit ISO dates.
+
+    The parser deliberately reads the raw current turn only.  A date copied
+    into model context, recalled memory, or a worker-generated config is not
+    evidence of user authority.
+    """
+    values = _ISO_DATE_RE.findall(user_message or "")
+    if len(values) >= 2:
+        try:
+            start, end = date.fromisoformat(values[0]), date.fromisoformat(values[1])
+        except ValueError:
+            start = end = None
+        if start is not None and end is not None and start <= end:
+            return {
+                "source": "current_user_explicit",
+                "evidence_ref": evidence_ref,
+                "user_explicit": True,
+                "server_owned": True,
+            }
+    return {
+        "source": "unknown",
+        "evidence_ref": evidence_ref,
+        "user_explicit": False,
+        "server_owned": True,
+    }

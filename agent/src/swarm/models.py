@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -376,6 +377,7 @@ class SwarmRun(BaseModel):
     launch_id: str | None = None
     provenance_validation_status: str = "not_required"
     preset_capabilities: PresetCapabilities | None = None
+    window_authority: dict[str, Any] | None = None
 
 
 class WorkerResult(BaseModel):

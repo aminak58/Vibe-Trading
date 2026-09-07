@@ -775,6 +775,7 @@ class SwarmTool(BaseTool):
         on_started = kwargs.get("__on_swarm_started")
         cancel_event = kwargs.get("__cancel_event")
         launch_id = kwargs.get("__launch_id")
+        window_authority = kwargs.get("__window_authority")
 
         if not prompt:
             return json.dumps(
@@ -865,6 +866,8 @@ class SwarmTool(BaseTool):
                 start_kwargs["owner_session_id"] = trusted_owner_session_id
             if isinstance(launch_id, str):
                 start_kwargs["launch_id"] = launch_id
+            if isinstance(window_authority, dict):
+                start_kwargs["window_authority"] = dict(window_authority)
             run = runtime.start_run(preset, variables, **start_kwargs)
         except FileNotFoundError as exc:
             return json.dumps(

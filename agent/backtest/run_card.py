@@ -31,6 +31,7 @@ def write_run_card(
     strategy_path: Path | None = None,
     warnings: Sequence[str] | None = None,
     artifact_refs: Sequence[Mapping[str, Any]] | None = None,
+    window_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Write JSON and Markdown run cards for a backtest run.
 
@@ -88,6 +89,16 @@ def write_run_card(
         card["mt5_snapshot"] = {key: mt5_snapshot.get(key) for key in keys if key in mt5_snapshot}
     if "validation" in metrics:
         card["validation"] = metrics["validation"]
+
+    # This is intentionally supplied outside worker-writable ``config.json``.
+    # A copied config or matching hash cannot establish window authority.
+    from backtest.research_window import build_research_window_metadata
+
+    card["research_window"] = build_research_window_metadata(
+        config,
+        metrics,
+        authority=window_authority,
+    )
 
     card = _json_safe(card)
     json_path = run_dir / "run_card.json"

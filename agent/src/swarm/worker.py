@@ -687,6 +687,7 @@ def run_worker(
     agent_config: AgentConfig | None = None,
     cancel_event: threading.Event | None = None,
     execution_identity: ExecutionIdentity | None = None,
+    window_authority: dict[str, Any] | None = None,
 ) -> WorkerResult:
     """Run one worker task, releasing the per-task LLM client on exit.
 
@@ -739,6 +740,7 @@ def run_worker(
             agent_config=agent_config,
             cancel_event=cancel_event,
             execution_identity=execution_identity,
+            window_authority=window_authority,
         )
     finally:
         llm.close()
@@ -759,6 +761,7 @@ def _run_worker_impl(
     llm: ChatLLM,
     cancel_event: threading.Event | None = None,
     execution_identity: ExecutionIdentity | None = None,
+    window_authority: dict[str, Any] | None = None,
 ) -> WorkerResult:
     """Execute a single worker task using a lightweight ReAct loop.
 
@@ -1240,6 +1243,8 @@ def _run_worker_impl(
                 # boundary before a child process can execute it.
                 args["__execution_identity"] = execution_identity
                 args["__swarm_run_id"] = run_dir.name
+                if window_authority is not None:
+                    args["__window_authority"] = dict(window_authority)
             factor_input_error = (
                 _prepare_strict_factor_analysis_inputs(
                     execution_identity,
