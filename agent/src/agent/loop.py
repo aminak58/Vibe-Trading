@@ -1251,6 +1251,84 @@ class AgentLoop:
         if workflow_obligation is not None:
             workflow_obligation.record_swarm_result(result)
         self._clear_completed_swarm_ownership(result)
+        self._last_owned_swarm_tool_result = result
+
+    def _owned_swarm_terminal_handoff(self) -> dict[str, Any] | None:
+        """Return one server-owned terminal handoff for this parent turn.
+
+        A direct ``run_swarm`` call can finish within its bounded wait.  That
+        result is already an owned server response, but the loop previously
+        treated its ``failed`` status as ordinary tool feedback and resumed
+        model planning.  Reconcile the canonical store first; if it is not
+        available at this exact boundary, retain the direct server result as
+        the factual terminal response rather than allowing parent-side work.
+        """
+        raw_result = getattr(self, "_last_owned_swarm_tool_result", None)
+        if not isinstance(raw_result, str):
+            return None
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        status = str(payload.get("status") or "").casefold()
+        if status not in {"completed", "failed", "cancelled", "rejected"}:
+            return None
+        workflow_obligation = getattr(self, "_workflow_obligation", None)
+        if workflow_obligation is None:
+            return None
+        obligation = workflow_obligation.obligation
+        run_id = str(payload.get("run_id") or "")
+        if (
+            not obligation.dispatch_attempted
+            or not run_id
+            or run_id != obligation.swarm_run_id
+        ):
+            return None
+        payload_launch_id = str(payload.get("launch_id") or "")
+        if payload_launch_id and payload_launch_id != str(obligation.launch_id or ""):
+            return None
+        payload_owner_session = str(payload.get("owner_session_id") or "")
+        if (
+            payload_owner_session
+            and payload_owner_session != str(self._trusted_owner_session_id or "")
+        ):
+            return None
+
+        # The normal path enriches the response from the canonical store and
+        # applies the existing artifact/provenance checks.  A direct terminal
+        # result remains safe only as a minimal fallback when that store read
+        # is temporarily unavailable; it is still exact-run bound above.
+        try:
+            canonical = self._reconcile_owned_swarm_from_store()
+        except Exception:  # noqa: BLE001
+            logger.warning("could not reconcile direct owned Swarm terminal result", exc_info=True)
+            canonical = None
+        if canonical is not None:
+            return canonical
+
+        terminal_reason = str(
+            payload.get("terminal_reason") or payload.get("error") or ""
+        ).strip()
+        artifact_status: dict[str, Any] = {}
+        for task in payload.get("tasks") or []:
+            if not isinstance(task, dict) or not task.get("id"):
+                continue
+            artifact_status[str(task["id"])] = {
+                "status": str(task.get("status") or "unknown"),
+                "artifact_count": len(task.get("artifact_refs") or task.get("artifacts") or []),
+            }
+        fallback: dict[str, Any] = {
+            "status": status,
+            "run_id": run_id,
+            "terminal_reason": terminal_reason or None,
+            "artifact_status": artifact_status,
+        }
+        if status == "completed":
+            fallback["final_report"] = str(payload.get("final_report") or "")
+        return fallback
 
     def _bind_started_swarm_run(self, run_id: str) -> None:
         """Bind and index a launched Swarm before its bounded wait begins."""
@@ -1406,13 +1484,16 @@ class AgentLoop:
         required-artifact checks; this adapter only loads the persisted Swarm
         aggregate root through its canonical store.
         """
-        from src.swarm.store import SwarmStore, swarm_runs_root
-
-        store = SwarmStore(base_dir=swarm_runs_root())
         obligation = getattr(self, "_workflow_obligation", None)
         obligation_run_id = (
             obligation.obligation.swarm_run_id if obligation is not None else None
         )
+        if not obligation_run_id and not self._active_swarm_run_id:
+            return None
+
+        from src.swarm.store import SwarmStore, swarm_runs_root
+
+        store = SwarmStore(base_dir=swarm_runs_root())
         if obligation_run_id:
             run = store.load_run(obligation_run_id)
             if run is None:
@@ -1579,6 +1660,7 @@ class AgentLoop:
         self._active_swarm_identity_hash = None
         self._active_swarm_launch_id = None
         self._active_swarm_owner_session_id = None
+        self._last_owned_swarm_tool_result: str | None = None
         self._pre_dispatch_tool_result_unavailable = False
         self._trusted_owner_session_id = session_id if isinstance(session_id, str) and session_id else None
         self._strict_swarm_user_message = user_message
@@ -1795,6 +1877,25 @@ class AgentLoop:
                         react_trace,
                         current_iter,
                     )
+                    owned_terminal_handoff = self._owned_swarm_terminal_handoff()
+                    if owned_terminal_handoff is not None:
+                        final_content = self._render_owned_swarm_terminal_response(
+                            owned_terminal_handoff
+                        )
+                        trace.write(
+                            {
+                                "type": "owned_swarm_terminal_handoff",
+                                "iter": current_iter,
+                                "result": owned_terminal_handoff,
+                            }
+                        )
+                        react_trace.append(
+                            {
+                                "type": "owned_swarm_terminal_handoff",
+                                "status": owned_terminal_handoff.get("status"),
+                            }
+                        )
+                        break
                     continue
 
                 if self._pre_dispatch_budget_exhausted(iteration):
@@ -2345,6 +2446,26 @@ class AgentLoop:
                 compact_requested, focus_topic = self._process_tool_calls(
                     response.tool_calls, context, messages, trace, react_trace, current_iter,
                 )
+
+                owned_terminal_handoff = self._owned_swarm_terminal_handoff()
+                if owned_terminal_handoff is not None:
+                    final_content = self._render_owned_swarm_terminal_response(
+                        owned_terminal_handoff
+                    )
+                    trace.write(
+                        {
+                            "type": "owned_swarm_terminal_handoff",
+                            "iter": current_iter,
+                            "result": owned_terminal_handoff,
+                        }
+                    )
+                    react_trace.append(
+                        {
+                            "type": "owned_swarm_terminal_handoff",
+                            "status": owned_terminal_handoff.get("status"),
+                        }
+                    )
+                    break
 
                 # Layer 3: compress after all tools have executed
                 if compact_requested:

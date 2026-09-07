@@ -149,6 +149,25 @@ class _RecordingSwarmTool(BaseTool):
         )
 
 
+class _TerminalSwarmTool(BaseTool):
+    """Return an owned terminal Swarm result after the dispatcher binds it."""
+
+    name = "run_swarm"
+    description = "test-only terminal Swarm dispatcher"
+    parameters: dict[str, Any] = {"type": "object", "properties": {}}
+    is_readonly = False
+
+    def __init__(self, payload: dict[str, Any], *, started_run_id: str | None = None) -> None:
+        self.payload = payload
+        self.started_run_id = started_run_id or str(payload["run_id"])
+        self.calls = 0
+
+    def execute(self, **kwargs: Any) -> str:
+        self.calls += 1
+        kwargs["__on_swarm_started"](self.started_run_id)
+        return json.dumps(self.payload)
+
+
 class _RecordingAdvisoryTool(BaseTool):
     def __init__(self, name: str) -> None:
         self.name = name
@@ -395,7 +414,9 @@ def test_completed_owned_swarm_remains_eligible_for_normal_parent_success(tmp_pa
     assert agent._swarm_obligation_terminal_blocker(tmp_path / "run", []) is None
 
 
-def test_verified_strict_swarm_dispatches_before_advisory_market_data(tmp_path: Path) -> None:
+def test_verified_strict_swarm_dispatches_before_advisory_market_data(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A model cannot spend its post-identity turn on a coverage probe."""
     registry = ToolRegistry()
     registry.register(_StrictMt5ResolverTool())
@@ -405,6 +426,13 @@ def test_verified_strict_swarm_dispatches_before_advisory_market_data(tmp_path: 
     registry.register(advisory)
     llm = _ResolveThenAdvisoryLLM("get_market_data")
     agent = _agent(tmp_path, llm, registry, max_iterations=5)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
 
     result = agent.run(user_message=STRICT_SWARM_REQUEST)
 
@@ -414,10 +442,167 @@ def test_verified_strict_swarm_dispatches_before_advisory_market_data(tmp_path: 
         for event in TraceWriter.read(tmp_path / "run")
         if event.get("type") == "tool_call"
     ]
-    assert calls.index("run_swarm") < calls.index("get_market_data")
+    assert calls == ["search_symbol", "run_swarm"]
+    assert advisory.calls == 0
     assert swarm.calls[0]["prompt"] == STRICT_SWARM_REQUEST
     assert swarm.calls[0]["__execution_identity"].resolutions[0].resolved_symbol == "XAUUSD_o"
     assert result["status"] == "failed"
+
+
+def test_owned_terminal_failed_swarm_stops_parent_before_advisory_tools(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A direct owned terminal result ends the parent loop immediately."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    swarm = _TerminalSwarmTool(
+        {
+            "status": "failed",
+            "run_id": "swarm-terminal-failed",
+            "error": (
+                "backtest_artifact_contract_incomplete: "
+                "missing=backtest.execution_provenance,backtest.config"
+            ),
+            "tasks": [
+                {"id": "task-backtest", "status": "failed"},
+                {"id": "task-risk", "status": "blocked"},
+                {"id": "task-report", "status": "blocked"},
+            ],
+        }
+    )
+    advisory = _RecordingAdvisoryTool("get_market_data")
+    registry.register(swarm)
+    registry.register(advisory)
+    agent = _agent(tmp_path, _ResolveThenAdvisoryLLM("get_market_data"), registry)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
+    # This unit test exercises the direct tool-result handoff; canonical-store
+    # reconciliation is covered separately and would pull optional MCP deps.
+    agent._reconcile_owned_swarm_from_store = lambda: None
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    assert swarm.calls == 1
+    assert advisory.calls == 0
+    assert result["status"] == "failed"
+    assert "backtest_artifact_contract_incomplete" in result["content"]
+    calls = [
+        event["tool"]
+        for event in TraceWriter.read(tmp_path / "run")
+        if event.get("type") == "tool_call"
+    ]
+    assert calls == ["search_symbol", "run_swarm"]
+
+
+def test_owned_terminal_completed_swarm_returns_official_report_without_more_tools(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Completed owned runs bypass another model turn and expose the report."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    swarm = _TerminalSwarmTool(
+        {
+            "status": "completed",
+            "run_id": "swarm-terminal-completed",
+            "final_report": "Official limited-baseline conclusion.",
+            "tasks": [],
+        }
+    )
+    advisory = _RecordingAdvisoryTool("load_skill")
+    registry.register(swarm)
+    registry.register(advisory)
+    agent = _agent(tmp_path, _ResolveThenAdvisoryLLM("load_skill"), registry)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
+    agent._reconcile_owned_swarm_from_store = lambda: None
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    assert swarm.calls == 1
+    assert advisory.calls == 0
+    assert result["status"] == "success"
+    assert result["content"] == "Official limited-baseline conclusion."
+
+
+def test_owned_terminal_no_usable_bars_is_scoped_to_backtest_handoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A failed worker handoff cannot be paraphrased as global MT5 absence."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    swarm = _TerminalSwarmTool(
+        {
+            "status": "failed",
+            "run_id": "swarm-terminal-no-bars",
+            "error": "backtest acquisition/handoff failed: MT5 returned no usable bars",
+            "tasks": [{"id": "task-backtest", "status": "failed"}],
+        }
+    )
+    registry.register(swarm)
+    agent = _agent(tmp_path, _ResolveThenAdvisoryLLM("get_market_data"), registry)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
+    agent._reconcile_owned_swarm_from_store = lambda: None
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    assert "backtest acquisition/handoff failed" in result["content"]
+    assert "MT5 globally has no data" not in result["content"]
+
+
+def test_unowned_terminal_result_does_not_stop_parent_loop(tmp_path: Path, monkeypatch) -> None:
+    """A terminal response with the wrong run id cannot hijack this parent."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    swarm = _TerminalSwarmTool(
+        {
+            "status": "failed",
+            "run_id": "swarm-not-owned-by-parent",
+            "terminal_reason": "unrelated terminal failure",
+        },
+        started_run_id="swarm-owned-by-parent",
+    )
+    advisory = _RecordingAdvisoryTool("get_market_data")
+    registry.register(swarm)
+    registry.register(advisory)
+    agent = _agent(tmp_path, _ResolveThenAdvisoryLLM("get_market_data"), registry)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
+    agent._reconcile_owned_swarm_from_store = lambda: None
+
+    agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    assert swarm.calls == 1
+    calls = [
+        event["tool"]
+        for event in TraceWriter.read(tmp_path / "run")
+        if event.get("type") == "tool_call"
+    ]
+    assert "get_market_data" in calls
+    assert not any(
+        event.get("type") == "owned_swarm_terminal_handoff"
+        for event in TraceWriter.read(tmp_path / "run")
+    )
 
 
 def test_verified_strict_swarm_dispatches_before_local_workaround_skill(tmp_path: Path) -> None:
