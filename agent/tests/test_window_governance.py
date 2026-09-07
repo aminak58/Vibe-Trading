@@ -106,6 +106,16 @@ def test_absent_coverage_probe_is_explicit_and_cannot_support_depth_claim() -> N
     assert metadata["history_depth_claim_supported"] is False
 
 
+def test_official_snapshot_row_count_populates_bars_count() -> None:
+    metadata = build_research_window_metadata(
+        _config(),
+        {},
+        snapshot_metadata={"row_count": 3518},
+    )
+
+    assert metadata["sample"]["bars_count"] == 3518
+
+
 def test_worker_writable_config_cannot_assert_server_owned_window_authority(tmp_path) -> None:
     config = _config()
     config["_server_window_authority"] = {
@@ -160,6 +170,25 @@ def test_post_execution_finalizer_uses_trusted_authority_not_config_claim(tmp_pa
     assert card["research_window"]["window_authority"]["source"] == "current_user_explicit"
 
 
+def test_post_execution_finalizer_uses_run_card_snapshot_for_bars_count(tmp_path) -> None:
+    config = _config()
+    config.pop("_mt5_snapshot_provenance")
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    write_run_card(tmp_path, config, {"trade_count": 17})
+    card_path = tmp_path / "run_card.json"
+    card = json.loads(card_path.read_text(encoding="utf-8"))
+    card["mt5_snapshot"] = {"row_count": 3518}
+    card_path.write_text(json.dumps(card), encoding="utf-8")
+
+    finalized = finalize_research_window_metadata(
+        tmp_path,
+        {"source": "unknown", "evidence_ref": "request:current", "server_owned": True},
+    )
+
+    assert finalized is not None
+    assert finalized["sample"]["bars_count"] == 3518
+
+
 def test_backtest_parent_finalizes_run_card_from_internal_authority(tmp_path, monkeypatch) -> None:
     config = _config() | {"source": "yfinance"}
     (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -209,6 +238,42 @@ def test_strict_report_renders_server_generated_limited_baseline_verdict() -> No
     assert "## Research Sufficiency (Server-Generated)" in report
     assert "unknown_not_enforced" in report
     assert "EDGE NOT SHOWN ON LIMITED BASELINE" in report
+    assert "Broad verdict authorized: `False`" in report
+
+
+def test_strict_report_rejects_broad_no_edge_verdict_on_unknown_sufficiency() -> None:
+    try:
+        render_bound_strict_report(
+            _binding_with_unknown_window(),
+            "**Verdict: NO — no tradeable edge.**",
+        )
+    except NarrativeMismatch as exc:
+        assert "unauthorized broad verdict" in str(exc)
+    else:
+        raise AssertionError("unauthorized broad no-edge verdict was accepted")
+
+
+def test_strict_report_allows_limited_negative_baseline_language() -> None:
+    report = render_bound_strict_report(
+        _binding_with_unknown_window(),
+        "The observed limited baseline was negative; more evidence is required.",
+    )
+
+    assert "observed limited baseline was negative" in report
+
+
+def test_future_server_authorized_broad_verdict_remains_possible() -> None:
+    binding = _binding_with_unknown_window()
+    binding["research_window"] = {
+        **binding["research_window"],
+        "research_sufficiency": {"status": "sufficient"},
+        "verdict_authority": "server_policy",
+        "broad_verdict_authorized": True,
+    }
+
+    report = render_bound_strict_report(binding, "Verdict: NO — no tradeable edge.")
+
+    assert "no tradeable edge" in report
 
 
 def test_strict_report_blocks_unsupported_history_depth_claim_without_probe() -> None:
@@ -221,6 +286,18 @@ def test_strict_report_blocks_unsupported_history_depth_claim_without_probe() ->
         assert "unsupported history-depth claim" in str(exc)
     else:
         raise AssertionError("unsupported history-depth claim was accepted")
+
+
+def test_strict_report_blocks_terminal_depth_binding_claim_without_probe() -> None:
+    try:
+        render_bound_strict_report(
+            _binding_with_unknown_window(),
+            "The 5M terminal depth binding defines this window.",
+        )
+    except NarrativeMismatch as exc:
+        assert "unsupported history-depth claim" in str(exc)
+    else:
+        raise AssertionError("terminal depth binding claim was accepted")
 
 
 def test_strict_report_blocks_persian_history_depth_claim_without_probe() -> None:

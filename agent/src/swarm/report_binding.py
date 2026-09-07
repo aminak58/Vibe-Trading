@@ -28,11 +28,18 @@ _REQUIRED_ARTIFACT_TYPES = frozenset(
 )
 _FINAL_STRATEGY_HEADING = re.compile(r"(?im)^#{1,6}\s*final\s+strategy\b")
 _UNSUPPORTED_HISTORY_DEPTH_CLAIM = re.compile(
-    r"(?i)\b(?:m5|mt5|broker)\s+(?:history\s+)?depth\s+"
-    r"(?:defines?|limits?|limited|caused)\s+(?:the\s+)?window\b"
+    r"(?i)\b(?:m5|5m|mt5|broker)\s+(?:terminal\s+)?(?:history\s+)?depth\s+"
+    r"(?:binding|defines?|limits?|limited|caused)\b"
     r"|(?:عمق\s*(?:تاریخچه\s*)?(?:m5|mt5|متاتریدر|۵\s*دقیقه)|"
     r"(?:m5|mt5|متاتریدر|۵\s*دقیقه)\s*(?:history|تاریخچه))"
     r".{0,80}(?:پنجره|محدود)",
+)
+_BROAD_NEGATIVE_VERDICT = re.compile(
+    r"(?i)\b(?:no\s+(?:tradeable|tradable)\s+edge|no\s+edge|"
+    r"strategy\s+(?:has\s+)?no\s+edge|reject\s+(?:the\s+)?strategy|"
+    r"discard\s+(?:the\s+)?strategy|not\s+(?:tradeable|tradable)|"
+    r"production\s+unsuitable)\b|"
+    r"(?:استراتژی\s*(?:رد|غیرقابل\s*معامله)|لبه\s*(?:ندارد|نشان\s*نمی‌دهد))"
 )
 
 
@@ -184,6 +191,12 @@ def render_bound_strict_report(binding: Mapping[str, Any], worker_report: str) -
         and _UNSUPPORTED_HISTORY_DEPTH_CLAIM.search(worker_report or "")
     ):
         raise NarrativeMismatch("unsupported history-depth claim without coverage probe")
+    broad_verdict_authorized = (
+        research_window.get("verdict_authority") == "server_policy"
+        and research_window.get("broad_verdict_authorized") is True
+    )
+    if not broad_verdict_authorized and _BROAD_NEGATIVE_VERDICT.search(worker_report or ""):
+        raise NarrativeMismatch("unauthorized broad verdict for limited research baseline")
     sufficiency = research_window.get("research_sufficiency")
     sufficiency = sufficiency if isinstance(sufficiency, Mapping) else {}
     authority = research_window.get("window_authority")
@@ -204,6 +217,8 @@ def render_bound_strict_report(binding: Mapping[str, Any], worker_report: str) -
         + f"- Coverage probe: `{coverage_probe.get('status', 'not_performed')}`\n"
         + f"- Research sufficiency: `{sufficiency.get('status', 'unknown_not_enforced')}`\n"
         + f"- Official conclusion: **{conclusion}**\n"
+        + f"- Verdict authority: `{research_window.get('verdict_authority', 'unknown')}`\n"
+        + f"- Broad verdict authorized: `{broad_verdict_authorized}`\n"
         + "\n\n## Research Report\n\n"
         + (worker_report or "")
     )

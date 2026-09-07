@@ -64,6 +64,7 @@ def finalize_research_window_metadata(run_dir: Path, authority: Mapping[str, Any
         config,
         metrics if isinstance(metrics, Mapping) else {},
         authority=authority,
+        snapshot_metadata=card.get("mt5_snapshot") if isinstance(card.get("mt5_snapshot"), Mapping) else None,
     )
     card["research_window"] = metadata
     temporary = run_card_path.with_suffix(".json.tmp")
@@ -77,6 +78,7 @@ def build_research_window_metadata(
     metrics: Mapping[str, Any],
     *,
     authority: Mapping[str, Any] | None = None,
+    snapshot_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build conservative, serializable metadata for a completed backtest.
 
@@ -85,7 +87,7 @@ def build_research_window_metadata(
     than inferred from config contents, hashes, or worker prose.
     """
     window_authority = _normalize_authority(authority)
-    snapshot = config.get("_mt5_snapshot_provenance")
+    snapshot = snapshot_metadata if isinstance(snapshot_metadata, Mapping) else config.get("_mt5_snapshot_provenance")
     snapshot = snapshot if isinstance(snapshot, Mapping) else {}
     validation = metrics.get("validation")
     validation = validation if isinstance(validation, Mapping) else {}
@@ -109,6 +111,8 @@ def build_research_window_metadata(
         },
         "research_sufficiency": {"status": "unknown_not_enforced"},
         "official_conclusion": "EDGE NOT SHOWN ON LIMITED BASELINE",
+        "verdict_authority": "server_limited_baseline_v0.1",
+        "broad_verdict_authorized": False,
     }
 
 
