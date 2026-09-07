@@ -45,6 +45,7 @@ from src.swarm.presets import build_run_from_preset
 from src.execution_identity import ExecutionIdentity
 from src.execution_provenance import validate_execution_provenance
 from src.swarm.store import SwarmStore
+from src.swarm.terminal_reconciliation import finalize_terminal_owned_swarm
 from src.swarm.task_store import (
     TaskStore,
     resolve_dependencies,
@@ -1129,6 +1130,17 @@ class SwarmRuntime:
         final_status = run.status
 
         self._store.update_run(run)
+        # A bounded tool wait may already have returned when the background
+        # run reaches terminal state.  Converge only a pre-existing, exact
+        # server-owned parent/session ownership record; this never dispatches
+        # or retries work and cannot derive a parent path from worker/model
+        # input.
+        try:
+            finalize_terminal_owned_swarm(run)
+        except Exception:
+            # Parent-state projection is repairable through later recovery;
+            # it must never make the canonical run lose its terminal event.
+            logger.warning("terminal parent reconciliation failed for run %s", run_id, exc_info=True)
         self._emit_event(run_id, self._make_event("run_completed", data={"status": final_status.value}))
 
         # Cleanup cancel event and live callback
