@@ -25,6 +25,7 @@ import threading
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from src.agent.context import ContextBuilder
@@ -1009,6 +1010,8 @@ class AgentLoop:
         self._pre_dispatch_tool_result_unavailable = False
         self._trusted_owner_session_id: str | None = None
         self._window_authority: dict[str, Any] | None = None
+        self._strict_swarm_user_message: str | None = None
+        self._strict_swarm_attachment_unavailable = False
 
     def cancel(self) -> None:
         """Cancel the current loop.
@@ -1578,6 +1581,8 @@ class AgentLoop:
         self._active_swarm_owner_session_id = None
         self._pre_dispatch_tool_result_unavailable = False
         self._trusted_owner_session_id = session_id if isinstance(session_id, str) and session_id else None
+        self._strict_swarm_user_message = user_message
+        self._strict_swarm_attachment_unavailable = False
         run_started_wall = _time.time()
 
         state_store = RunStateStore()
@@ -1762,6 +1767,35 @@ class AgentLoop:
                 iteration += 1
                 self._run_iteration += 1
                 current_iter = self._run_iteration
+
+                dispatch_priority, dispatch_blocker = self._strict_swarm_dispatch_priority()
+                if dispatch_blocker is not None:
+                    pre_dispatch_budget_reason = dispatch_blocker
+                    trace.write(
+                        {
+                            "type": "swarm_dispatch_priority_blocked",
+                            "iter": current_iter,
+                            "reason": dispatch_blocker,
+                        }
+                    )
+                    break
+                if dispatch_priority:
+                    trace.write(
+                        {
+                            "type": "swarm_dispatch_priority",
+                            "iter": current_iter,
+                            "suppressed_parent_planning": True,
+                        }
+                    )
+                    self._process_tool_calls(
+                        [self._server_owned_swarm_dispatch_call(current_iter)],
+                        context,
+                        messages,
+                        trace,
+                        react_trace,
+                        current_iter,
+                    )
+                    continue
 
                 if self._pre_dispatch_budget_exhausted(iteration):
                     pre_dispatch_budget_reason = (
@@ -2628,12 +2662,35 @@ class AgentLoop:
             if self._grounding is not None
             else "not_required"
         )
+        identity_precondition_pending = self._strict_swarm_identity_precondition_pending()
 
         # Cancelled before this turn's tools ran — skip execution entirely.
         if self._cancel_event.is_set():
             return compact_requested, focus_topic
 
         for tc in tool_calls:
+            if (
+                identity_precondition_pending
+                and tc.name not in {"search_symbol", "read_document"}
+            ):
+                execution_plan.append(
+                    (
+                        tc,
+                        json.dumps(
+                            {
+                                "status": "error",
+                                "error_code": "swarm_required_identity_precondition",
+                                "tool": tc.name,
+                                "message": (
+                                    "Resolve the strict execution identity before "
+                                    "running parent-side advisory work."
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                )
+                continue
             # Layer 4: compact tool — mark then defer execution
             if tc.name == "compact":
                 compact_requested = True
@@ -3299,6 +3356,64 @@ class AgentLoop:
             and iteration > min(MAX_SWARM_PRE_DISPATCH_ITERATIONS, self.max_iterations - 1)
         )
 
+    def _strict_swarm_dispatch_priority(self) -> tuple[bool, str | None]:
+        """Return whether a server-owned strict Swarm dispatch must run now.
+
+        A current-user strict Swarm obligation owns execution once its identity
+        is verified.  Parent-side probes, config construction, and advisory
+        skills cannot become implicit prerequisites after that point.
+        """
+        ledger = self._workflow_obligation
+        identity_ledger = self._execution_identity
+        if ledger is None or identity_ledger is None:
+            return False, None
+        obligation = ledger.obligation
+        identity = identity_ledger.snapshot()
+        strict_pending_dispatch = (
+            obligation.mode is WorkflowMode.SWARM_REQUIRED
+            and not obligation.dispatch_attempted
+            and identity.mode.value == "source_scoped"
+            and identity.policy.source_mode.value == "strict"
+        )
+        if strict_pending_dispatch and identity.status.value == "rejected":
+            return False, "strict_execution_identity_unavailable"
+        if (
+            not strict_pending_dispatch
+            or identity.status.value != "verified"
+        ):
+            return False, None
+        if not self._strict_swarm_user_message:
+            return False, "swarm_dispatch_context_unavailable"
+        if self._strict_swarm_attachment_unavailable:
+            return False, "required_attachment_unavailable"
+        if self.registry.get("run_swarm") is None:
+            return False, "run_swarm_unavailable"
+        return True, None
+
+    def _strict_swarm_identity_precondition_pending(self) -> bool:
+        """Whether strict Swarm planning may execute only identity/context tools."""
+        ledger = self._workflow_obligation
+        identity_ledger = self._execution_identity
+        if ledger is None or identity_ledger is None:
+            return False
+        obligation = ledger.obligation
+        identity = identity_ledger.snapshot()
+        return (
+            obligation.mode is WorkflowMode.SWARM_REQUIRED
+            and not obligation.dispatch_attempted
+            and identity.mode.value == "source_scoped"
+            and identity.policy.source_mode.value == "strict"
+            and identity.status.value == "partially_specified"
+        )
+
+    def _server_owned_swarm_dispatch_call(self, iteration: int) -> SimpleNamespace:
+        """Build the sole strict dispatch call from the raw current request."""
+        return SimpleNamespace(
+            id=f"server-owned-swarm-dispatch-{iteration}",
+            name="run_swarm",
+            arguments={"prompt": self._strict_swarm_user_message},
+        )
+
     def _pending_write_directive(
         self, user_message: str, run_started_wall: float
     ) -> str:
@@ -3410,6 +3525,13 @@ class AgentLoop:
         self._last_activity_wall = _time.time()
 
         success = _is_tool_success(result)
+        if (
+            tc.name == "read_document"
+            and not success
+            and self._strict_swarm_user_message
+            and "[Uploaded file:" in self._strict_swarm_user_message
+        ):
+            self._strict_swarm_attachment_unavailable = True
         if success:
             self._called_ok.add(tc.name)
             if tc.name == "backtest":
