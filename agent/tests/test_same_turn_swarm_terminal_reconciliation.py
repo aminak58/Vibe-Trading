@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -179,6 +178,55 @@ def test_same_turn_rejected_terminal_result_is_rendered_explicitly(
     assert result is not None
     assert "terminal status: rejected" in result["content"]
     assert "preset_unavailable" in result["content"]
+
+
+def test_same_turn_uses_root_failure_not_downstream_block_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    agent = _waiting_agent(tmp_path)
+    run = _terminal_run(RunStatus.failed)
+    run.tasks = [
+        SwarmTask(
+            id="task-report", agent_id="report_aggregator", prompt_template="x",
+            status="blocked", error="Blocked: upstream not completed (task-risk=failed)",
+        ),
+        SwarmTask(
+            id="task-risk", agent_id="risk_auditor", prompt_template="x",
+            status="failed", error="provider_stream_error: 429 INFERENCE_CAP_ERROR",
+        ),
+    ]
+    _configure_store(monkeypatch, tmp_path, run)
+
+    result = agent._reconcile_owned_swarm_before_final_response()
+
+    assert result is not None
+    assert "429 INFERENCE_CAP_ERROR" in result["content"]
+    assert result["reconciliation"]["downstream_consequences"][0]["task_id"] == "task-report"
+
+
+def test_terminal_failure_renderer_reports_official_partial_backtest_without_claiming_final_report() -> None:
+    content = AgentLoop._render_owned_swarm_terminal_response({
+        "status": "failed",
+        "run_id": RUN_ID,
+        "terminal_reason": "provider_stream_error: 429 INFERENCE_CAP_ERROR",
+        "partial_backtest": {
+            "completed": True,
+            "provenance_validation_status": "passed",
+            "official_artifact_types": ["backtest.metrics", "backtest.trades"],
+            "research_pipeline_incomplete": True,
+        },
+        "downstream_consequences": [{
+            "task_id": "task-report",
+            "agent_id": "report_aggregator",
+            "status": "blocked",
+            "error": "task-risk=failed",
+        }],
+    })
+
+    assert "429 INFERENCE_CAP_ERROR" in content
+    assert "Official strict backtest completed" in content
+    assert "backtest.metrics, backtest.trades" in content
+    assert "Final report was not produced" in content
 
 
 class _StaleTextResponse:

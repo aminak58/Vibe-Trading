@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from src.agent.current_user_intent import explicit_source_from_current_user_message
+from src.agent.terminal_summary import summarize_terminal_run
 
 
 WORKFLOW_OBLIGATION_ARTIFACT = "workflow_obligation.json"
@@ -187,15 +188,17 @@ def obligation_from_current_user_message(user_message: str) -> WorkflowObligatio
 class WorkflowObligationLedger:
     """Persist and enforce the server-side workflow obligation for one run."""
 
-    def __init__(self, *, run_dir: Path, user_message: str) -> None:
+    def __init__(
+        self, *, run_dir: Path, user_message: str, restore_terminal: bool = False
+    ) -> None:
         self.run_dir = Path(run_dir)
         restored = self._load()
         # A running/waiting swarm survives a server restart.  A terminal
         # artifact must never impose a previous turn's workflow on this turn.
-        if restored and restored.mode is WorkflowMode.SWARM_REQUIRED and restored.status in {
-            WorkflowStatus.SWARM_STARTED,
-            WorkflowStatus.WAITING,
-        }:
+        if restored and restored.mode is WorkflowMode.SWARM_REQUIRED and (
+            restore_terminal
+            or restored.status in {WorkflowStatus.SWARM_STARTED, WorkflowStatus.WAITING}
+        ):
             self._obligation = restored
         else:
             self._obligation = obligation_from_current_user_message(user_message)
@@ -289,7 +292,7 @@ class WorkflowObligationLedger:
         obligation = self._obligation
         if (
             obligation.mode is not WorkflowMode.SWARM_REQUIRED
-            or obligation.status not in {WorkflowStatus.SWARM_STARTED, WorkflowStatus.WAITING}
+            or obligation.status is WorkflowStatus.PENDING
             or not obligation.swarm_run_id
             or getattr(run, "id", None) != obligation.swarm_run_id
             or getattr(run, "launch_id", None) != obligation.launch_id
@@ -299,22 +302,8 @@ class WorkflowObligationLedger:
 
         status = str(getattr(getattr(run, "status", None), "value", "")).casefold()
         if status in {"failed", "rejected"}:
-            task_errors = [
-                str(getattr(task, "error", "") or "").strip()
-                for task in getattr(run, "tasks", [])
-                if str(getattr(task, "error", "") or "").strip()
-            ]
-            terminal_reason = task_errors[0] if task_errors else "owned_swarm_terminal_failure"
-            artifact_status = {
-                str(getattr(task, "id", "")): {
-                    "status": (
-                        getattr(getattr(task, "status", None), "value", None)
-                        or str(getattr(task, "status", ""))
-                    ),
-                    "artifact_count": len(getattr(task, "artifact_refs", [])),
-                }
-                for task in getattr(run, "tasks", [])
-            }
+            summary = summarize_terminal_run(run)
+            terminal_reason = str(summary["terminal_reason"])
             self._obligation = obligation.transition(
                 WorkflowStatus.FAILED,
                 terminal_result_status=status,
@@ -324,8 +313,7 @@ class WorkflowObligationLedger:
             return {
                 "status": "failed",
                 "run_id": obligation.swarm_run_id,
-                "terminal_reason": terminal_reason,
-                "artifact_status": artifact_status,
+                **summary,
             }
         if status in {"cancelled", "canceled"}:
             self._obligation = obligation.transition(

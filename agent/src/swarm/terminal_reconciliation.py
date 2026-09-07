@@ -121,21 +121,6 @@ def finalize_terminal_owned_swarm(
             return persisted_result
         return None
 
-    # A terminal research failure may still follow an official completed
-    # backtest.  Preserve only registered, provenance-passed backtest types so
-    # recovery/UI consumers can distinguish that partial success from no
-    # backtest having run, without treating worker prose as evidence.
-    result["official_backtest_artifact_types"] = sorted(
-        {
-            str(getattr(ref, "artifact_type", ""))
-            for task in getattr(run, "tasks", [])
-            for ref in getattr(task, "artifact_refs", [])
-            if str(getattr(ref, "artifact_type", "")).startswith("backtest.")
-            and getattr(ref, "producer_run_id", None) == run_id
-            and getattr(ref, "provenance_status", None) == "passed"
-        }
-    )
-
     result_status = str(result.get("status") or "").casefold()
     ownership_status = (
         "rejected"

@@ -25,7 +25,7 @@ import threading
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from src.agent.context import ContextBuilder
 from src.agent.grounding import GroundingLedger
@@ -1274,10 +1274,6 @@ class AgentLoop:
         status = reconciled.status.value if hasattr(reconciled.status, "value") else str(reconciled.status)
         if status not in {"completed", "failed", "cancelled", "rejected"}:
             return {"status": "running", "run_id": swarm_run_id}
-        persisted_result = index.get("terminal_result")
-        if isinstance(persisted_result, dict) and persisted_result.get("status"):
-            return persisted_result
-
         parent_dir = RUNS_DIR / parent_run_id
         ownership_path = parent_dir / "swarm_ownership.json"
         try:
@@ -1290,7 +1286,9 @@ class AgentLoop:
             or ownership.get("owner_session_id") != self._trusted_owner_session_id
         ):
             return None
-        old_obligation = WorkflowObligationLedger(run_dir=parent_dir, user_message="")
+        old_obligation = WorkflowObligationLedger(
+            run_dir=parent_dir, user_message="", restore_terminal=True
+        )
         result = old_obligation.reconcile_owned_swarm(
             reconciled, owner_session_id=self._trusted_owner_session_id
         )
@@ -1466,6 +1464,17 @@ class AgentLoop:
             content = f"The owned Swarm {run_id} reached terminal status: {status}."
             if reason:
                 content += f" Reason: {reason}."
+            partial_backtest = reconciled.get("partial_backtest")
+            if isinstance(partial_backtest, dict) and partial_backtest.get("completed"):
+                artifact_types = ", ".join(
+                    str(value) for value in partial_backtest.get("official_artifact_types", [])
+                )
+                content += " Official strict backtest completed with provenance passed"
+                if artifact_types:
+                    content += f" and registered artifacts: {artifact_types}"
+                content += "."
+                if partial_backtest.get("research_pipeline_incomplete"):
+                    content += " Final report was not produced because the research pipeline is incomplete."
             artifact_status = reconciled.get("artifact_status")
             if isinstance(artifact_status, dict):
                 content += " Official task artifact status is available for audit."

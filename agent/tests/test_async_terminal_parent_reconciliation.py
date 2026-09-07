@@ -37,7 +37,10 @@ def _terminal_run(status: RunStatus = RunStatus.failed) -> SwarmRun:
             artifact_type=kind,
             provenance_status="passed",
         )
-        for kind in ("backtest.metrics", "backtest.trades", "backtest.equity")
+        for kind in (
+            "backtest.execution_provenance", "backtest.config", "backtest.run_card",
+            "backtest.strategy", "backtest.metrics", "backtest.trades", "backtest.equity",
+        )
     ]
     return SwarmRun(
         id=SWARM,
@@ -151,10 +154,15 @@ def test_async_provider_failure_preserves_reason_and_partial_artifact_status(tmp
     assert "429 INFERENCE_CAP_ERROR" in str(result["terminal_reason"])
     assert result["artifact_status"]["task-backtest"]["status"] == "completed"
     assert result["official_backtest_artifact_types"] == [
+        "backtest.config",
         "backtest.equity",
+        "backtest.execution_provenance",
         "backtest.metrics",
+        "backtest.run_card",
+        "backtest.strategy",
         "backtest.trades",
     ]
+    assert result["partial_backtest"]["completed"] is True
     index = _read(sessions_dir / SESSION / "swarm_ownership.json")
     assert "429 INFERENCE_CAP_ERROR" in str(index["terminal_reason"])
     assert _read(parent_dir / "workflow_obligation.json")["terminal_result_status"] == "failed"

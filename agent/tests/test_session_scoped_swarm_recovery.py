@@ -315,3 +315,77 @@ def test_new_ui_turn_replaces_model_stale_text_with_session_recovery(
     assert "terminal status: failed" in result["content"]
     assert "official report blocked" in result["content"]
     assert result["swarm_reconciliation"]["run_id"] == SWARM
+
+
+def test_cross_parent_recovery_uses_root_failure_and_keeps_blocked_report_as_consequence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    old_agent, _ = _old_owner(tmp_path)
+    run = _owned_run(RunStatus.failed)
+    run.tasks = [
+        SwarmTask(
+            id="task-report", agent_id="report_aggregator", prompt_template="x",
+            status="blocked", error="Blocked: upstream not completed (task-risk=failed)",
+        ),
+        SwarmTask(
+            id="task-risk", agent_id="risk_auditor", prompt_template="x",
+            status="failed", error="provider_stream_error: 429 INFERENCE_CAP_ERROR",
+        ),
+    ]
+    _configure_roots(monkeypatch, tmp_path, run)
+    old_agent._persist_session_swarm_ownership("running")
+    fresh = AgentLoop(
+        ToolRegistry(), SimpleNamespace(), memory=WorkspaceMemory(run_dir=str(tmp_path / "runs" / "new-parent"))
+    )
+    fresh._trusted_owner_session_id = SESSION
+
+    result = fresh._reconcile_session_owned_swarm_from_store()
+
+    assert result is not None
+    assert "429 INFERENCE_CAP_ERROR" in result["terminal_reason"]
+    assert result["downstream_consequences"][0]["task_id"] == "task-report"
+
+
+def test_cross_parent_recovery_replaces_stale_persisted_terminal_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    old_agent, old_dir = _old_owner(tmp_path)
+    run = _owned_run(RunStatus.failed)
+    run.tasks = [
+        SwarmTask(
+            id="task-report", agent_id="report_aggregator", prompt_template="x",
+            status="blocked", error="Blocked: upstream not completed (task-risk=failed)",
+        ),
+        SwarmTask(
+            id="task-risk", agent_id="risk_auditor", prompt_template="x",
+            status="failed", error="provider_stream_error: 429 INFERENCE_CAP_ERROR",
+        ),
+    ]
+    sessions = _configure_roots(monkeypatch, tmp_path, run)
+    old_agent._workflow_obligation = WorkflowObligationLedger(run_dir=old_dir, user_message="")
+    old_agent._workflow_obligation._obligation = old_agent._workflow_obligation.obligation.transition(
+        WorkflowStatus.FAILED,
+        terminal_result_status="failed",
+        terminal_reason="Blocked: upstream not completed (task-risk=failed)",
+    )
+    old_agent._workflow_obligation.persist()
+    old_agent._persist_session_swarm_ownership(
+        "failed",
+        terminal_reason="Blocked: upstream not completed (task-risk=failed)",
+        terminal_result={"status": "failed", "terminal_reason": "Blocked: upstream not completed (task-risk=failed)"},
+    )
+    fresh = AgentLoop(
+        ToolRegistry(), SimpleNamespace(), memory=WorkspaceMemory(run_dir=str(tmp_path / "runs" / "new-parent"))
+    )
+    fresh._trusted_owner_session_id = SESSION
+
+    result = fresh._reconcile_session_owned_swarm_from_store()
+
+    assert result is not None
+    assert "429 INFERENCE_CAP_ERROR" in result["terminal_reason"]
+    assert "429 INFERENCE_CAP_ERROR" in json.loads(
+        (old_dir / "workflow_obligation.json").read_text()
+    )["terminal_reason"]
+    assert "429 INFERENCE_CAP_ERROR" in json.loads(
+        (sessions / SESSION / "swarm_ownership.json").read_text()
+    )["terminal_result"]["terminal_reason"]
