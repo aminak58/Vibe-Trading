@@ -63,6 +63,10 @@ class RunStateStore:
         """
         self._write_json(run_dir / "state.json", {"status": "failed", "reason": reason})
 
+    def mark_waiting(self, run_dir: Path, reason: str) -> None:
+        """Record that a dispatched background workflow remains authoritative."""
+        self._write_json(run_dir / "state.json", {"status": "waiting", "reason": reason})
+
     def mark_cancelled(self, run_dir: Path, reason: str = "cancelled by user") -> None:
         """Mark the run as cancelled by the user.
 

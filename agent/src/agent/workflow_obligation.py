@@ -255,6 +255,19 @@ class WorkflowObligationLedger:
             self._obligation = self._obligation.transition(WorkflowStatus.SWARM_STARTED, dispatch_attempted=True, launch_id="launch-" + uuid.uuid4().hex)
             self.persist()
 
+    def fail_pre_dispatch(self, reason: str) -> None:
+        """Close an undispatched strict obligation without inventing a Swarm run."""
+        if (
+            self._obligation.mode is WorkflowMode.SWARM_REQUIRED
+            and not self._obligation.dispatch_attempted
+        ):
+            self._obligation = self._obligation.transition(
+                WorkflowStatus.FAILED,
+                terminal_result_status="failed",
+                terminal_reason=reason,
+            )
+            self.persist()
+
     def bind_swarm_run(self, run_id: str) -> None:
         if self._obligation.mode is WorkflowMode.SWARM_REQUIRED and self._obligation.dispatch_attempted and not self._obligation.swarm_run_id:
             self._obligation = self._obligation.transition(self._obligation.status, swarm_run_id=run_id)

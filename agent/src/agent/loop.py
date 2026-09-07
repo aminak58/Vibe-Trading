@@ -61,6 +61,12 @@ SESSIONS_DIR = get_sessions_dir()
 KEEP_RECENT = 3
 LLM_USAGE_ARTIFACT = "llm_usage.json"
 
+# A strict current-user Swarm request should dispatch promptly.  This is a
+# parent-loop ceiling only: it neither retries prerequisites nor starts a
+# Swarm.  It prevents a model from repeatedly planning around unavailable
+# evidence until the general (much larger) iteration budget is exhausted.
+MAX_SWARM_PRE_DISPATCH_ITERATIONS = 8
+
 COLLAPSE_PRESERVE_RECENT = 6
 COLLAPSE_TEXT_MIN = 2400
 COLLAPSE_HEAD = 900
@@ -687,6 +693,41 @@ def _is_tool_success(result: str) -> bool:
     return True
 
 
+def _minimal_prepared_config_error(run_dir: Path) -> str | None:
+    """Return a stable error code when a parent-run config is unusable.
+
+    ``write_file`` deliberately remains generic.  This narrow check only
+    applies to a config that a strict parent run could otherwise present as a
+    prepared backtest configuration.
+    """
+    path = run_dir / "config.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return "invalid_prepared_config"
+    if not isinstance(payload, dict):
+        return "invalid_prepared_config"
+    source = payload.get("source")
+    codes = payload.get("codes")
+    start_date = payload.get("start_date")
+    end_date = payload.get("end_date")
+    if (
+        not isinstance(source, str)
+        or not source.strip()
+        or not isinstance(codes, list)
+        or not codes
+        or not all(isinstance(code, str) and code.strip() for code in codes)
+        or not isinstance(start_date, str)
+        or not start_date.strip()
+        or not isinstance(end_date, str)
+        or not end_date.strip()
+    ):
+        return "invalid_prepared_config"
+    return None
+
+
 # Provider tool-call markup that a model can emit as plain text on the
 # forced-text final iteration, where tool definitions are withheld. Releasing
 # it verbatim hands the user mojibake instead of an answer. Both DSML bar
@@ -965,6 +1006,7 @@ class AgentLoop:
         self._active_swarm_identity_hash: str | None = None
         self._active_swarm_launch_id: str | None = None
         self._active_swarm_owner_session_id: str | None = None
+        self._pre_dispatch_tool_result_unavailable = False
         self._trusted_owner_session_id: str | None = None
         self._window_authority: dict[str, Any] | None = None
 
@@ -1534,6 +1576,7 @@ class AgentLoop:
         self._active_swarm_identity_hash = None
         self._active_swarm_launch_id = None
         self._active_swarm_owner_session_id = None
+        self._pre_dispatch_tool_result_unavailable = False
         self._trusted_owner_session_id = session_id if isinstance(session_id, str) and session_id else None
         run_started_wall = _time.time()
 
@@ -1692,6 +1735,7 @@ class AgentLoop:
         goal_continuations = 0
         goal_last_progress: tuple[int, int] | None = None
         wrap_up_at = max(1, int(self.max_iterations * 0.8))
+        pre_dispatch_budget_reason: str | None = None
 
         # Zombie-run watchdog: fail a run that makes no forward progress
         # (no LLM completion, no tool result) for the stall timeout instead
@@ -1718,6 +1762,22 @@ class AgentLoop:
                 iteration += 1
                 self._run_iteration += 1
                 current_iter = self._run_iteration
+
+                if self._pre_dispatch_budget_exhausted(iteration):
+                    pre_dispatch_budget_reason = (
+                        "swarm_required_pre_dispatch_budget_exhausted"
+                    )
+                    trace.write(
+                        {
+                            "type": "pre_dispatch_budget_exhausted",
+                            "iter": current_iter,
+                            "max_pre_dispatch_iterations": min(
+                                MAX_SWARM_PRE_DISPATCH_ITERATIONS,
+                                self.max_iterations - 1,
+                            ),
+                        }
+                    )
+                    break
 
                 # Inject background task notifications
                 bg = get_background_manager()
@@ -2317,6 +2377,18 @@ class AgentLoop:
                 }
             )
 
+        obligation_terminal_blocker = self._swarm_obligation_terminal_blocker(
+            run_dir, messages
+        )
+        if obligation_terminal_blocker is not None:
+            trace.write(
+                {
+                    "type": "swarm_obligation_terminal_blocked",
+                    "iter": self._run_iteration,
+                    "details": obligation_terminal_blocker,
+                }
+            )
+
         # Determine final status. The reason is also propagated into the
         # returned dict so SessionService can surface a meaningful UI
         # message instead of "Execution failed: unknown" (issue #114).
@@ -2338,6 +2410,28 @@ class AgentLoop:
             )
             state_store.mark_failure(run_dir, final_reason)
             final_status = "failed"
+        elif pre_dispatch_budget_reason is not None:
+            final_reason = pre_dispatch_budget_reason
+            workflow_obligation = self._workflow_obligation
+            if workflow_obligation is not None:
+                workflow_obligation.fail_pre_dispatch(final_reason)
+            state_store.mark_failure(run_dir, final_reason)
+            final_status = "failed"
+        elif obligation_terminal_blocker is not None:
+            final_reason = str(obligation_terminal_blocker["error_code"])
+            terminal_state = obligation_terminal_blocker["terminal_state"]
+            if terminal_state == "waiting":
+                state_store.mark_waiting(run_dir, final_reason)
+                final_status = "waiting"
+            elif terminal_state == "cancelled":
+                state_store.mark_cancelled(run_dir, final_reason)
+                final_status = "cancelled"
+            else:
+                workflow_obligation = self._workflow_obligation
+                if workflow_obligation is not None:
+                    workflow_obligation.fail_pre_dispatch(final_reason)
+                state_store.mark_failure(run_dir, final_reason)
+                final_status = "failed"
         elif (run_dir / "artifacts" / "metrics.csv").exists() or final_content:
             state_store.mark_success(run_dir)
             final_status = "success"
@@ -2414,6 +2508,9 @@ class AgentLoop:
         )
         if final_reason is not None:
             result["reason"] = final_reason
+        if obligation_terminal_blocker is not None:
+            result["obligation_blocker"] = obligation_terminal_blocker
+            result["error_code"] = obligation_terminal_blocker["error_code"]
 
         self._run_done.set()
 
@@ -2547,13 +2644,6 @@ class AgentLoop:
 
             tool_def = self.registry.get(tc.name)
             is_repeatable = tool_def.repeatable if tool_def else False
-            if tc.name in self._called_ok and not is_repeatable:
-                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
-                skip_msg = json.dumps({"skipped": True, "reason": f"{tc.name} already completed successfully. Use the previous result."})
-                messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
-                trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
-                react_trace.append({"type": "tool_skipped", "tool": tc.name})
-                continue
 
             ownership_block = self._swarm_ownership_block(tc.name)
             if ownership_block is not None:
@@ -2630,6 +2720,55 @@ class AgentLoop:
                         },
                     )
                     continue
+
+            if tc.name in self._called_ok and not is_repeatable:
+                prior_was_cleared = any(
+                    message.get("role") == "tool"
+                    and message.get("name") == tc.name
+                    and message.get("content") == "[cleared]"
+                    for message in messages
+                )
+                if prior_was_cleared:
+                    self._pre_dispatch_tool_result_unavailable = True
+                    unavailable = json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "tool_result_unavailable",
+                            "tool": tc.name,
+                            "message": (
+                                "The prior successful result is no longer available "
+                                "to the planner and no replayable identical payload exists."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    messages.append(context.format_tool_result(tc.id, tc.name, unavailable))
+                    trace.write(
+                        {
+                            "type": "tool_result_unavailable",
+                            "iter": iteration,
+                            "tool": tc.name,
+                            "call_id": tc.id,
+                        }
+                    )
+                    react_trace.append(
+                        {"type": "tool_result_unavailable", "tool": tc.name}
+                    )
+                    continue
+                logger.warning(f"Blocked duplicate call: {tc.name} (already succeeded)")
+                skip_msg = json.dumps(
+                    {
+                        "skipped": True,
+                        "reason": (
+                            f"{tc.name} already completed successfully. "
+                            "Use the previous result."
+                        ),
+                    }
+                )
+                messages.append(context.format_tool_result(tc.id, tc.name, skip_msg))
+                trace.write({"type": "tool_skipped", "iter": iteration, "tool": tc.name})
+                react_trace.append({"type": "tool_skipped", "tool": tc.name})
+                continue
 
             execution_plan.append((tc, None))
 
@@ -3089,6 +3228,76 @@ class AgentLoop:
             self._written_files.add(str(p.resolve()).casefold())
         except (OSError, ValueError):
             self._written_files.add(str(p).casefold())
+
+    def _swarm_obligation_terminal_blocker(
+        self, run_dir: Path, messages: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        """Return a server-owned reason why strict parent success is forbidden."""
+        ledger = self._workflow_obligation
+        if ledger is None:
+            return None
+        obligation = ledger.obligation
+        if obligation.mode is not WorkflowMode.SWARM_REQUIRED:
+            return None
+
+        identity_status = None
+        if self._execution_identity is not None:
+            identity_status = self._execution_identity.snapshot().status.value
+        details = {
+            "mode": obligation.mode.value,
+            "obligation_status": obligation.status.value,
+            "dispatch_attempted": obligation.dispatch_attempted,
+            "swarm_run_id": obligation.swarm_run_id,
+            "identity_status": identity_status,
+            "tool_payloads_cleared": any(
+                message.get("role") == "tool" and message.get("content") == "[cleared]"
+                for message in messages
+            ),
+            "tool_payload_unavailable": self._pre_dispatch_tool_result_unavailable,
+        }
+
+        if not obligation.dispatch_attempted:
+            config_error = _minimal_prepared_config_error(run_dir)
+            reason = config_error or "swarm_required_pre_dispatch_incomplete"
+            return {"error_code": reason, "terminal_state": "failed", **details}
+
+        if obligation.status.value == "completed" and obligation.swarm_run_id:
+            return None
+        if obligation.status.value == "cancelled":
+            return {
+                "error_code": obligation.terminal_reason or "swarm_required_terminal_cancelled",
+                "terminal_state": "cancelled",
+                **details,
+            }
+        if obligation.status.value == "failed":
+            return {
+                "error_code": obligation.terminal_reason or "swarm_required_terminal_failed",
+                "terminal_state": "failed",
+                **details,
+            }
+        if obligation.swarm_run_id:
+            return {
+                "error_code": "swarm_required_terminal_reconciliation_incomplete",
+                "terminal_state": "waiting",
+                **details,
+            }
+        return {
+            "error_code": "swarm_required_dispatch_unbound",
+            "terminal_state": "failed",
+            **details,
+        }
+
+    def _pre_dispatch_budget_exhausted(self, iteration: int) -> bool:
+        """Bound parent-only planning before an explicitly required Swarm starts."""
+        ledger = self._workflow_obligation
+        if ledger is None:
+            return False
+        obligation = ledger.obligation
+        return (
+            obligation.mode is WorkflowMode.SWARM_REQUIRED
+            and not obligation.dispatch_attempted
+            and iteration > min(MAX_SWARM_PRE_DISPATCH_ITERATIONS, self.max_iterations - 1)
+        )
 
     def _pending_write_directive(
         self, user_message: str, run_started_wall: float
