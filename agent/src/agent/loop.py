@@ -1330,6 +1330,69 @@ class AgentLoop:
             fallback["final_report"] = str(payload.get("final_report") or "")
         return fallback
 
+    def _owned_swarm_active_handoff(self) -> dict[str, Any] | None:
+        """Return one exact owned active-Swarm handoff for this parent turn.
+
+        A bounded ``run_swarm`` wait can return while the owned execution is
+        still pending/running.  Parent planning must stop at that boundary:
+        the canonical Swarm store and trusted session index own subsequent
+        progress and terminal recovery.  This performs no polling, dispatch,
+        retry, artifact read, or model-mediated status interpretation.
+        """
+        raw_result = getattr(self, "_last_owned_swarm_tool_result", None)
+        if not isinstance(raw_result, str):
+            return None
+        try:
+            payload = json.loads(raw_result)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        status = str(payload.get("status") or "").casefold()
+        if status not in {"pending", "running"}:
+            return None
+        workflow_obligation = getattr(self, "_workflow_obligation", None)
+        if workflow_obligation is None:
+            return None
+        obligation = workflow_obligation.obligation
+        if obligation.mode is not WorkflowMode.SWARM_REQUIRED:
+            return None
+        run_id = str(payload.get("run_id") or "")
+        if (
+            not obligation.dispatch_attempted
+            or not run_id
+            or run_id != obligation.swarm_run_id
+            or run_id != self._active_swarm_run_id
+        ):
+            return None
+        if self._active_swarm_launch_id != obligation.launch_id:
+            return None
+        if self._active_swarm_owner_session_id != self._trusted_owner_session_id:
+            return None
+        payload_launch_id = str(payload.get("launch_id") or "")
+        if payload_launch_id and payload_launch_id != str(obligation.launch_id or ""):
+            return None
+        payload_owner_session = str(payload.get("owner_session_id") or "")
+        if (
+            payload_owner_session
+            and payload_owner_session != str(self._trusted_owner_session_id or "")
+        ):
+            return None
+        return {
+            "status": status,
+            "run_id": run_id,
+            "wait_budget_exhausted": bool(payload.get("wait_budget_exhausted")),
+        }
+
+    @staticmethod
+    def _render_owned_swarm_active_response(handoff: dict[str, Any]) -> str:
+        """Render the one factual reply permitted while an owned Swarm runs."""
+        return (
+            f"The owned Swarm {handoff['run_id']} is still running. "
+            "Its terminal result will be reconciled from the official Swarm store."
+        )
+
     def _bind_started_swarm_run(self, run_id: str) -> None:
         """Bind and index a launched Swarm before its bounded wait begins."""
         workflow_obligation = getattr(self, "_workflow_obligation", None)
@@ -1700,8 +1763,17 @@ class AgentLoop:
         # the parent can plan a new turn; this performs no dispatch or retry.
         reconciled_swarm_result = self._reconcile_owned_swarm_from_store()
         session_recovered_swarm_result = None
+        session_active_swarm_result = None
+        if reconciled_swarm_result is None:
+            self._restore_active_session_swarm_if_running()
+            if self._active_swarm_run_id is not None:
+                session_active_swarm_result = {
+                    "status": "running",
+                    "run_id": self._active_swarm_run_id,
+                }
         if (
             reconciled_swarm_result is None
+            and session_active_swarm_result is None
             and self._workflow_obligation.obligation.mode is WorkflowMode.NONE
         ):
             session_recovered_swarm_result = self._reconcile_session_owned_swarm_from_store()
@@ -1762,6 +1834,56 @@ class AgentLoop:
             value=user_message,
             offload_kind=f"user-message-{self._run_iteration + 1}",
         )
+
+        if session_active_swarm_result is not None:
+            # An exact session-owned Swarm is still active.  Its canonical
+            # store/index own all progress until terminalization; do not enter
+            # a model or tool loop merely to poll or inspect it.
+            final_content = self._render_owned_swarm_active_response(
+                session_active_swarm_result
+            )
+            final_reason = "owned_swarm_active"
+            state_store.mark_waiting(run_dir, final_reason)
+            trace.write(
+                {
+                    "type": "session_owned_swarm_active_quiescence",
+                    "iter": self._run_iteration + 1,
+                    "result": session_active_swarm_result,
+                }
+            )
+            trace.write(
+                {
+                    "type": "end",
+                    "iter": self._run_iteration + 1,
+                    "status": "waiting",
+                    "reason": final_reason,
+                    "iterations": 0,
+                }
+            )
+            trace.close()
+            self._run_done.set()
+            configured_model = self._llm_runtime.configured_model
+            return {
+                "status": "waiting",
+                "reason": final_reason,
+                "run_dir": str(run_dir),
+                "run_id": run_dir.name,
+                "content": final_content,
+                "react_trace": [
+                    {
+                        "type": "session_owned_swarm_active_quiescence",
+                        "status": session_active_swarm_result.get("status"),
+                    }
+                ],
+                "iterations": 0,
+                "max_iterations": self.max_iterations,
+                "swarm_reconciliation": session_active_swarm_result,
+                "provider": self._llm_runtime.provider,
+                "configured_model": configured_model,
+                "model": configured_model,
+                "model_source": "configured",
+                "reasoning_effort": self._llm_runtime.reasoning_effort,
+            }
 
         if session_recovered_swarm_result is not None:
             # Cross-parent recovery is a server-owned status operation.  Do
@@ -1893,6 +2015,25 @@ class AgentLoop:
                             {
                                 "type": "owned_swarm_terminal_handoff",
                                 "status": owned_terminal_handoff.get("status"),
+                            }
+                        )
+                        break
+                    owned_active_handoff = self._owned_swarm_active_handoff()
+                    if owned_active_handoff is not None:
+                        final_content = self._render_owned_swarm_active_response(
+                            owned_active_handoff
+                        )
+                        trace.write(
+                            {
+                                "type": "owned_swarm_active_quiescence",
+                                "iter": current_iter,
+                                "result": owned_active_handoff,
+                            }
+                        )
+                        react_trace.append(
+                            {
+                                "type": "owned_swarm_active_quiescence",
+                                "status": owned_active_handoff["status"],
                             }
                         )
                         break
@@ -2463,6 +2604,26 @@ class AgentLoop:
                         {
                             "type": "owned_swarm_terminal_handoff",
                             "status": owned_terminal_handoff.get("status"),
+                        }
+                    )
+                    break
+
+                owned_active_handoff = self._owned_swarm_active_handoff()
+                if owned_active_handoff is not None:
+                    final_content = self._render_owned_swarm_active_response(
+                        owned_active_handoff
+                    )
+                    trace.write(
+                        {
+                            "type": "owned_swarm_active_quiescence",
+                            "iter": current_iter,
+                            "result": owned_active_handoff,
+                        }
+                    )
+                    react_trace.append(
+                        {
+                            "type": "owned_swarm_active_quiescence",
+                            "status": owned_active_handoff["status"],
                         }
                     )
                     break

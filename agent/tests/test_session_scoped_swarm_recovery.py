@@ -23,6 +23,13 @@ LAUNCH = "launch-owned"
 SWARM = "owned-session-swarm"
 
 
+class _NoModelTurnLLM:
+    """A session-active handoff must return before any model invocation."""
+
+    def stream_chat(self, *args, **kwargs):
+        raise AssertionError("an active owned Swarm must not enter a model turn")
+
+
 def _owned_run(status: RunStatus, *, session: str = SESSION, launch: str = LAUNCH) -> SwarmRun:
     return SwarmRun(
         id=SWARM,
@@ -125,6 +132,31 @@ def test_session_recovery_preserves_a_genuinely_running_owned_swarm(
 
     assert fresh._reconcile_session_owned_swarm_from_store() == {"status": "running", "run_id": SWARM}
     assert json.loads((old_dir / "swarm_ownership.json").read_text())["status"] == "running"
+
+
+def test_new_parent_quiesces_for_running_session_owned_swarm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later turn reports the indexed running Swarm without a model/tool loop."""
+    old_agent, _ = _old_owner(tmp_path)
+    run = _owned_run(RunStatus.running)
+    run.tasks[0].status = TaskStatus.in_progress
+    run.tasks[0].error = None
+    _configure_roots(monkeypatch, tmp_path, run)
+    old_agent._persist_session_swarm_ownership("running")
+
+    new_parent = tmp_path / "runs" / "new-parent"
+    new_parent.mkdir(parents=True)
+    fresh = AgentLoop(
+        ToolRegistry(), _NoModelTurnLLM(), memory=WorkspaceMemory(run_dir=str(new_parent))
+    )
+
+    result = fresh.run("report the owned Swarm status", session_id=SESSION)
+
+    assert result["status"] == "waiting"
+    assert "still running" in result["content"]
+    state = json.loads((new_parent / "state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "waiting"
 
 
 def test_new_execution_is_blocked_while_session_index_owns_a_running_swarm(

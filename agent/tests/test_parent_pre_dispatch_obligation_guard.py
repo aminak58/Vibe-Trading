@@ -168,6 +168,30 @@ class _TerminalSwarmTool(BaseTool):
         return json.dumps(self.payload)
 
 
+class _RunningSwarmTool(BaseTool):
+    """Return an owned Swarm that outlives the direct wait budget."""
+
+    name = "run_swarm"
+    description = "test-only running Swarm dispatcher"
+    parameters: dict[str, Any] = {"type": "object", "properties": {}}
+    is_readonly = False
+
+    def __init__(self, *, run_id: str = "swarm-running") -> None:
+        self.run_id = run_id
+        self.calls = 0
+
+    def execute(self, **kwargs: Any) -> str:
+        self.calls += 1
+        kwargs["__on_swarm_started"](self.run_id)
+        return json.dumps(
+            {
+                "status": "running",
+                "run_id": self.run_id,
+                "wait_budget_exhausted": True,
+            }
+        )
+
+
 class _RecordingAdvisoryTool(BaseTool):
     def __init__(self, name: str) -> None:
         self.name = name
@@ -447,6 +471,61 @@ def test_verified_strict_swarm_dispatches_before_advisory_market_data(
     assert swarm.calls[0]["prompt"] == STRICT_SWARM_REQUEST
     assert swarm.calls[0]["__execution_identity"].resolutions[0].resolved_symbol == "XAUUSD_o"
     assert result["status"] == "failed"
+
+
+def test_owned_running_swarm_quiesces_parent_before_advisory_tools(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A still-running owned Swarm ends this parent turn before model drift."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    swarm = _RunningSwarmTool()
+    advisory = _RecordingAdvisoryTool("get_market_data")
+    registry.register(swarm)
+    registry.register(advisory)
+    llm = _ResolveThenAdvisoryLLM("get_market_data")
+    agent = _agent(tmp_path, llm, registry, max_iterations=5)
+    monkeypatch.setattr(
+        WorkflowObligationLedger,
+        "prepare_run_swarm",
+        lambda _self, arguments, _identity: arguments.update(
+            {"preset_name": "quant_scalp_desk"}
+        ) or None,
+    )
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST, session_id="session-running")
+
+    assert swarm.calls == 1
+    assert advisory.calls == 0
+    assert llm.calls == 1
+    assert result["status"] == "waiting"
+    assert "still running" in result["content"]
+
+
+def test_running_result_for_different_swarm_cannot_quiesce_owned_parent(
+    tmp_path: Path,
+) -> None:
+    """A non-owned active result cannot hijack the parent's waiting handoff."""
+    agent = _agent(tmp_path, _FinalTextLLM())
+    ledger = WorkflowObligationLedger(
+        run_dir=tmp_path / "run", user_message=STRICT_SWARM_REQUEST
+    )
+    ledger.mark_swarm_started()
+    ledger.bind_swarm_run("swarm-owned")
+    agent._workflow_obligation = ledger
+    agent._trusted_owner_session_id = "session-owned"
+    agent._active_swarm_run_id = "swarm-owned"
+    agent._active_swarm_launch_id = ledger.obligation.launch_id
+    agent._active_swarm_owner_session_id = "session-owned"
+    agent._last_owned_swarm_tool_result = json.dumps(
+        {
+            "status": "running",
+            "run_id": "swarm-other",
+            "wait_budget_exhausted": True,
+        }
+    )
+
+    assert agent._owned_swarm_active_handoff() is None
 
 
 def test_owned_terminal_failed_swarm_stops_parent_before_advisory_tools(
