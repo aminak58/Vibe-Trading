@@ -284,7 +284,14 @@ def _worker_user_vars() -> dict[str, str]:
     }
 
 
-def _run_strict_worker(monkeypatch, tmp_path: Path, llm: _ScriptedWorkerLLM, spy: _BacktestSpyTool):
+def _run_strict_worker(
+    monkeypatch,
+    tmp_path: Path,
+    llm: _ScriptedWorkerLLM,
+    spy: _BacktestSpyTool,
+    *,
+    event_callback=None,
+):
     registry = ToolRegistry()
     registry.register(spy)
     monkeypatch.setattr(worker_mod, "build_swarm_registry", lambda *args, **kwargs: registry)
@@ -297,6 +304,7 @@ def _run_strict_worker(monkeypatch, tmp_path: Path, llm: _ScriptedWorkerLLM, spy
         run_dir=tmp_path,
         execution_identity=_identity(),
         window_authority={"source": "unknown", "user_explicit": False},
+        event_callback=event_callback,
     )
 
 
@@ -341,13 +349,68 @@ def test_strict_worker_preflight_failure_suppresses_repeated_backtest_delegation
         ]
     )
     spy = _BacktestSpyTool()
+    original_validate = worker_mod.validate_strict_backtest_package
+    validation_calls: list[tuple[Path, object]] = []
+
+    def tracked_validate(artifact_dir: Path, bundle):
+        validation_calls.append((artifact_dir, bundle))
+        return original_validate(artifact_dir, bundle)
+
+    monkeypatch.setattr(worker_mod, "validate_strict_backtest_package", tracked_validate)
 
     _run_strict_worker(monkeypatch, tmp_path, llm, spy)
 
     assert spy.calls == []
+    assert len(validation_calls) == 1
     tool_messages = "\n".join(_all_worker_tool_messages(llm))
     assert "invalid_backtest_config_identity" in tool_messages
     assert "strict_backtest_preflight_already_failed" in tool_messages
+
+
+def test_strict_worker_emits_tool_result_for_every_preflight_block(monkeypatch, tmp_path: Path) -> None:
+    """Both blocked backtest calls must leave auditable error events."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        {
+            "resolved_symbol": "XAUUSD_o",
+            "source": "mt5",
+            "start_date": "2026-08-20",
+            "end_date": "2026-09-07",
+        },
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="No delegated strict backtest was run."),
+        ]
+    )
+    events = []
+
+    _run_strict_worker(
+        monkeypatch,
+        tmp_path,
+        llm,
+        _BacktestSpyTool(),
+        event_callback=events.append,
+    )
+
+    results = [
+        event.data
+        for event in events
+        if event.type == "tool_result" and event.data.get("tool") == "backtest"
+    ]
+    assert [result["status"] for result in results] == ["error", "error"]
+    assert [result["error_code"] for result in results] == [
+        "invalid_backtest_config_identity",
+        "strict_backtest_preflight_already_failed",
+    ]
 
 
 def test_strict_worker_valid_package_delegates_backtest_once(monkeypatch, tmp_path: Path) -> None:

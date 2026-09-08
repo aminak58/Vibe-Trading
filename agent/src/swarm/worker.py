@@ -1283,17 +1283,37 @@ def _run_worker_impl(
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
             if tc.name == "backtest" and strict_backtest_bundle is not None:
-                preflight = validate_strict_backtest_package(artifact_dir, strict_backtest_bundle)
                 if strict_preflight_failed:
                     result = json.dumps(
                         {"status": "error", "error_code": "strict_backtest_preflight_already_failed"},
                         ensure_ascii=False,
                     )
+                    _emit(event_callback, "tool_result", agent_id, task_id, {
+                        "tool": tc.name,
+                        "call_id": tc.id,
+                        "elapsed_ms": int((time.monotonic() - tc_start) * 1000),
+                        "status": "error",
+                        "error_code": "strict_backtest_preflight_already_failed",
+                        "iteration": iteration,
+                        "result_preview": _preview_tool_result(result),
+                        **mcp_meta,
+                    })
                     messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
                     continue
+                preflight = validate_strict_backtest_package(artifact_dir, strict_backtest_bundle)
                 if preflight is not None:
                     strict_preflight_failed = True
                     result = json.dumps(preflight, ensure_ascii=False)
+                    _emit(event_callback, "tool_result", agent_id, task_id, {
+                        "tool": tc.name,
+                        "call_id": tc.id,
+                        "elapsed_ms": int((time.monotonic() - tc_start) * 1000),
+                        "status": "error",
+                        "error_code": preflight.get("error_code", "strict_backtest_preflight_failed"),
+                        "iteration": iteration,
+                        "result_preview": _preview_tool_result(result),
+                        **mcp_meta,
+                    })
                     messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
                     continue
             if tc.name == "backtest" and execution_identity is not None:
