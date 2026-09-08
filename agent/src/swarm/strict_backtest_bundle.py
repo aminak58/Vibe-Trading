@@ -18,6 +18,7 @@ from src.execution_identity import (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+STRATEGY_SOURCE_USER_VAR = "__strict_strategy_source_v1"
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,46 @@ def materialize_strategy_source(
         content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         materialized_path=path.name,
     )
+
+
+def strategy_source_payload(text: str, evidence_ref: str) -> str:
+    """Encode server-extracted strategy text for trusted Swarm transport."""
+    if not isinstance(text, str) or not text.strip() or not isinstance(evidence_ref, str) or not evidence_ref:
+        raise ValueError("strategy source payload requires non-empty extracted text and evidence ref")
+    return json.dumps(
+        {
+            "schema_version": "strict-strategy-source/v1",
+            "text": text,
+            "evidence_ref": evidence_ref,
+            "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def strategy_source_from_user_vars(user_vars: dict[str, str], artifact_dir: Path) -> StrategySource:
+    """Materialize only a server-issued extracted-text payload for a worker."""
+    raw = user_vars.get(STRATEGY_SOURCE_USER_VAR)
+    if not isinstance(raw, str):
+        return StrategySource(status="unavailable")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return StrategySource(status="unavailable")
+    if not isinstance(payload, dict) or payload.get("schema_version") != "strict-strategy-source/v1":
+        return StrategySource(status="unavailable")
+    text = payload.get("text")
+    evidence_ref = payload.get("evidence_ref")
+    declared_hash = payload.get("content_hash")
+    if (
+        not isinstance(text, str)
+        or not isinstance(evidence_ref, str)
+        or not isinstance(declared_hash, str)
+        or hashlib.sha256(text.encode("utf-8")).hexdigest() != declared_hash
+    ):
+        return StrategySource(status="unavailable")
+    return materialize_strategy_source(artifact_dir, text=text, evidence_ref=evidence_ref)
 
 
 def is_strict_backtest_identity(identity: ExecutionIdentity | None) -> bool:

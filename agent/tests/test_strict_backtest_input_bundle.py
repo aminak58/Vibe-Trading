@@ -22,8 +22,12 @@ from src.swarm.strict_backtest_bundle import (
     StrategySource,
     build_strict_backtest_input_bundle,
     materialize_strategy_source,
+    strategy_source_from_user_vars,
+    strategy_source_payload,
     validate_strict_backtest_package,
 )
+from src.tools.swarm_tool import _attach_strict_strategy_source
+from src.swarm.worker import _strict_backtest_bundle_for_worker
 
 
 def _identity() -> ExecutionIdentity:
@@ -167,3 +171,43 @@ def test_server_owned_strategy_text_is_materialized_with_a_hash(tmp_path: Path) 
     assert len(source.content_hash) == 64
     assert source.materialized_path == "strategy_source.txt"
     assert (tmp_path / source.materialized_path).read_text(encoding="utf-8") == "Authoritative VWAP strategy rules."
+
+
+def test_raw_upload_handle_in_goal_does_not_establish_strategy_authority(tmp_path: Path) -> None:
+    source = strategy_source_from_user_vars(
+        {"goal": "[Uploaded file: strategy.pdf, path: uploads/strategy.pdf]"}, tmp_path
+    )
+
+    assert source.status == "unavailable"
+
+
+def test_server_owned_strategy_payload_materializes_for_worker(tmp_path: Path) -> None:
+    payload = strategy_source_payload("Authoritative VWAP rules.", "uploads/strategy.pdf")
+    source = strategy_source_from_user_vars({"__strict_strategy_source_v1": payload}, tmp_path)
+
+    assert source.status == "available"
+    assert source.evidence_ref == "uploads/strategy.pdf"
+    assert (tmp_path / "strategy_source.txt").read_text(encoding="utf-8") == "Authoritative VWAP rules."
+
+
+def test_swarm_tool_transports_only_successful_extracted_document(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.tools.doc_reader_tool.read_document",
+        lambda _path: json.dumps({"status": "ok", "text": "VWAP source", "file": "uploads/strategy.pdf"}),
+    )
+    variables = {"goal": "[Uploaded file: strategy.pdf, path: uploads/strategy.pdf]"}
+
+    _attach_strict_strategy_source(variables)
+
+    assert "__strict_strategy_source_v1" in variables
+
+
+def test_worker_uses_only_transport_payload_for_strict_bundle(tmp_path: Path) -> None:
+    payload = strategy_source_payload("VWAP source", "uploads/strategy.pdf")
+
+    bundle = _strict_backtest_bundle_for_worker(
+        _identity(), {"__strict_strategy_source_v1": payload}, tmp_path, window_authority={}
+    )
+
+    assert bundle is not None
+    assert bundle.strategy_source.status == "available"

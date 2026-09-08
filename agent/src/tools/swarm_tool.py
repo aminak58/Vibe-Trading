@@ -14,10 +14,38 @@ import time
 from typing import Any
 
 from src.agent.tools import BaseTool
+from src.swarm.strict_backtest_bundle import STRATEGY_SOURCE_USER_VAR, strategy_source_payload
 
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 5
+_UPLOADED_PATH_RE = re.compile(r"\[Uploaded file:[^\]]*?\bpath:\s*(uploads/[^\]\r\n]+)\]")
+
+
+def _attach_strict_strategy_source(variables: dict[str, str]) -> None:
+    """Attach only server-extracted upload text to strict Swarm variables."""
+    goal = variables.get("goal")
+    if not isinstance(goal, str):
+        return
+    match = _UPLOADED_PATH_RE.search(goal)
+    if match is None:
+        return
+    from src.tools.doc_reader_tool import read_document
+
+    try:
+        payload = json.loads(read_document(match.group(1).strip()))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict) or payload.get("status") not in {"ok", "success"}:
+        return
+    text = payload.get("text")
+    file_ref = payload.get("file")
+    if not isinstance(text, str) or not isinstance(file_ref, str):
+        return
+    try:
+        variables[STRATEGY_SOURCE_USER_VAR] = strategy_source_payload(text, file_ref)
+    except ValueError:
+        return
 
 
 def _max_wait_seconds() -> int:
@@ -815,6 +843,11 @@ class SwarmTool(BaseTool):
             if execution_identity is not None
             else _build_variables(preset, prompt)
         )
+        if execution_identity is not None:
+            from src.swarm.strict_backtest_bundle import is_strict_backtest_identity
+
+            if is_strict_backtest_identity(execution_identity):
+                _attach_strict_strategy_source(variables)
 
         logger.info(
             "SwarmTool: resolved preset=%s, variables=%s from prompt: %s",

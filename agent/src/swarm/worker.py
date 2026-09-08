@@ -42,6 +42,13 @@ from src.swarm.models import (
     WorkerResult,
 )
 from src.swarm.artifacts import ReadDependencyArtifactTool, verify_registered_artifact
+from src.swarm.strict_backtest_bundle import (
+    StrictBacktestInputBundle,
+    build_strict_backtest_input_bundle,
+    is_strict_backtest_identity,
+    strategy_source_from_user_vars,
+    validate_strict_backtest_package,
+)
 from src.tools import build_swarm_registry
 from src.tools.mcp import MCPRemoteTool
 from src.tools.path_utils import safe_path
@@ -53,6 +60,24 @@ _WORKER_FILE_TOOLS = {"write_file", "edit_file"}
 _WRITE_FILE_PATH_KEYS = ("path", "file_path", "filepath", "filename", "file")
 _FACTOR_PANEL_ARTIFACT = "factor_input.factor_panel"
 _FORWARD_RETURN_PANEL_ARTIFACT = "factor_input.forward_return_panel"
+
+
+def _strict_backtest_bundle_for_worker(
+    identity: ExecutionIdentity | None,
+    user_vars: dict[str, str],
+    artifact_dir: Path,
+    *,
+    window_authority: dict[str, Any] | None,
+) -> StrictBacktestInputBundle | None:
+    """Build the strict worker bundle solely from server-owned inputs."""
+    if not is_strict_backtest_identity(identity):
+        return None
+    assert identity is not None
+    return build_strict_backtest_input_bundle(
+        identity,
+        window_authority=window_authority,
+        strategy_source=strategy_source_from_user_vars(user_vars, artifact_dir),
+    )
 
 
 def _strict_factor_mode(identity: ExecutionIdentity | None) -> bool:
@@ -874,6 +899,26 @@ def _run_worker_impl(
     # 6. ReAct loop
     artifact_dir = agent_artifact_dir(run_dir, agent_id)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    strict_backtest_bundle = (
+        _strict_backtest_bundle_for_worker(
+            execution_identity, user_vars, artifact_dir, window_authority=window_authority
+        )
+        if task_id == "task-backtest"
+        else None
+    )
+    if strict_backtest_bundle is not None:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[SERVER STRICT BACKTEST BUNDLE] Use only codes="
+                    f"{list(strict_backtest_bundle.codes)!r}, source={strict_backtest_bundle.source!r}; "
+                    "write config.json and code/signal_engine.py. The strategy source is "
+                    f"{strict_backtest_bundle.strategy_source.status}."
+                ),
+            }
+        )
+    strict_preflight_failed = False
 
     t0 = time.monotonic()
     iteration = 0
@@ -1237,6 +1282,20 @@ def _run_worker_impl(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            if tc.name == "backtest" and strict_backtest_bundle is not None:
+                preflight = validate_strict_backtest_package(artifact_dir, strict_backtest_bundle)
+                if strict_preflight_failed:
+                    result = json.dumps(
+                        {"status": "error", "error_code": "strict_backtest_preflight_already_failed"},
+                        ensure_ascii=False,
+                    )
+                    messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
+                    continue
+                if preflight is not None:
+                    strict_preflight_failed = True
+                    result = json.dumps(preflight, ensure_ascii=False)
+                    messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
+                    continue
             if tc.name == "backtest" and execution_identity is not None:
                 # Not model-visible and never sourced from task prose.  The
                 # BacktestTool validates generated config.json at this final
