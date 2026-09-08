@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from src.agent.tools import BaseTool, ToolRegistry
 from src.execution_identity import (
     ExecutionIdentity,
     ExecutionIdentityStatus,
@@ -27,7 +28,10 @@ from src.swarm.strict_backtest_bundle import (
     validate_strict_backtest_package,
 )
 from src.tools.swarm_tool import _attach_strict_strategy_source
-from src.swarm.worker import _strict_backtest_bundle_for_worker
+import src.swarm.worker as worker_mod
+from src.providers.chat import LLMResponse, ToolCallRequest
+from src.swarm.models import SwarmAgentSpec, SwarmTask
+from src.swarm.worker import _strict_backtest_bundle_for_worker, agent_artifact_dir, run_worker
 
 
 def _identity() -> ExecutionIdentity:
@@ -211,3 +215,160 @@ def test_worker_uses_only_transport_payload_for_strict_bundle(tmp_path: Path) ->
 
     assert bundle is not None
     assert bundle.strategy_source.status == "available"
+
+
+class _BacktestSpyTool(BaseTool):
+    """Delegated backtest stand-in used to prove the worker boundary.
+
+    The test intentionally spies on ``execute`` rather than on the pure
+    preflight helper: a structural failure must not reach the delegated tool
+    at all.
+    """
+
+    name = "backtest"
+    description = "Mock backtest tool"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def execute(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return json.dumps({"status": "ok", "mock": "backtest-ran"})
+
+
+class _ScriptedWorkerLLM:
+    """Small ChatLLM stand-in that records messages across worker turns."""
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self._responses = list(responses)
+        self.received_messages: list[list[dict]] = []
+
+    def __call__(self, *args, **kwargs) -> "_ScriptedWorkerLLM":
+        return self
+
+    def close(self) -> None:
+        pass
+
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None, **kwargs) -> LLMResponse:
+        self.received_messages.append(list(messages))
+        return self._responses.pop(0)
+
+
+def _strict_backtest_agent() -> SwarmAgentSpec:
+    return SwarmAgentSpec(
+        id="backtester",
+        role="Strict strategy backtester",
+        system_prompt="Use the server-owned strict backtest bundle.",
+        tools=["backtest"],
+        skills=[],
+        max_iterations=3,
+        timeout_seconds=60,
+    )
+
+
+def _strict_backtest_task() -> SwarmTask:
+    return SwarmTask(
+        id="task-backtest",
+        agent_id="backtester",
+        prompt_template="{goal}",
+    )
+
+
+def _worker_user_vars() -> dict[str, str]:
+    return {
+        "goal": "Evaluate the attached strategy under the strict contract.",
+        "__strict_strategy_source_v1": strategy_source_payload(
+            "Authoritative VWAP strategy rules.", "artifact:strategy-source"
+        ),
+    }
+
+
+def _run_strict_worker(monkeypatch, tmp_path: Path, llm: _ScriptedWorkerLLM, spy: _BacktestSpyTool):
+    registry = ToolRegistry()
+    registry.register(spy)
+    monkeypatch.setattr(worker_mod, "build_swarm_registry", lambda *args, **kwargs: registry)
+    monkeypatch.setattr(worker_mod, "ChatLLM", llm)
+    return run_worker(
+        agent_spec=_strict_backtest_agent(),
+        task=_strict_backtest_task(),
+        upstream_summaries={},
+        user_vars=_worker_user_vars(),
+        run_dir=tmp_path,
+        execution_identity=_identity(),
+        window_authority={"source": "unknown", "user_explicit": False},
+    )
+
+
+def _all_worker_tool_messages(llm: _ScriptedWorkerLLM) -> list[str]:
+    return [
+        message["content"]
+        for turn in llm.received_messages
+        for message in turn
+        if message.get("role") == "tool"
+    ]
+
+
+def test_strict_worker_preflight_failure_suppresses_repeated_backtest_delegation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A failed strict preflight must never delegate either blind call.
+
+    This exercises the real worker tool-call loop: the model calls
+    ``backtest({})`` twice, but the first malformed package is rejected before
+    the registry and the second request receives the terminal preflight error.
+    """
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        {
+            "symbol": "XAUUSD_o",
+            "source": "mt5",
+            "start_date": "2026-08-20",
+            "end_date": "2026-09-07",
+        },
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="The strict package was rejected before any backtest delegation."),
+        ]
+    )
+    spy = _BacktestSpyTool()
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert spy.calls == []
+    tool_messages = "\n".join(_all_worker_tool_messages(llm))
+    assert "invalid_backtest_config_identity" in tool_messages
+    assert "strict_backtest_preflight_already_failed" in tool_messages
+
+
+def test_strict_worker_valid_package_delegates_backtest_once(monkeypatch, tmp_path: Path) -> None:
+    """A valid strict package remains able to reach the delegated tool once."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(artifact_dir, _valid_config())
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="valid", name="backtest", arguments={})]),
+            LLMResponse(content="The mocked strict backtest completed successfully."),
+        ]
+    )
+    spy = _BacktestSpyTool()
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["run_dir"] == str(artifact_dir)
+    assert spy.calls[0]["__execution_identity"] == _identity()
