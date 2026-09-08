@@ -23,9 +23,48 @@ TIMEZONE_CONFIDENCE = "official_mt5_sdk_utc"
 class MT5SnapshotError(ValueError):
     """Raised when a broker-backed MT5 snapshot cannot be trusted."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "mt5_snapshot_invalid_schema",
+        stage: str = "snapshot_validation",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.message = message
+        self.error_code = error_code
+        self.stage = stage
+        self.details = dict(details or {})
+        super().__init__(f"MT5-backed data acquisition/handoff failure: [{error_code}] {message}")
 
-def _fail(message: str) -> MT5SnapshotError:
-    return MT5SnapshotError(f"MT5-backed data acquisition/handoff failure: {message}")
+
+def _fail(
+    message: str,
+    *,
+    error_code: str = "mt5_snapshot_invalid_schema",
+    stage: str = "snapshot_validation",
+    details: dict[str, Any] | None = None,
+) -> MT5SnapshotError:
+    return MT5SnapshotError(message, error_code=error_code, stage=stage, details=details)
+
+
+def _diagnostic_details(
+    config: dict[str, Any],
+    *,
+    timeframe: str | None = None,
+    resolved_symbol: str | None = None,
+) -> dict[str, Any]:
+    codes = config.get("codes") or []
+    requested_symbol = codes[0].strip() if len(codes) == 1 and isinstance(codes[0], str) else None
+    return {
+        "requested_symbol": requested_symbol,
+        "codes": list(codes) if isinstance(codes, list) else [],
+        "resolved_symbol": resolved_symbol,
+        "interval": str(config.get("interval") or "1D"),
+        "timeframe": timeframe,
+        "requested_start": str(config.get("start_date") or ""),
+        "requested_end": str(config.get("end_date") or ""),
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -139,19 +178,64 @@ def prepare_mt5_snapshot(run_dir: Path, config: dict[str, Any]) -> dict[str, Any
 
     mt5 = mt5_loader._import_mt5()
     if mt5 is None or not mt5_loader._ensure_initialized():
-        raise _fail("MT5 terminal is unavailable in the trusted parent process")
+        raise _fail(
+            "MT5 terminal is unavailable in the trusted parent process.",
+            error_code="mt5_terminal_unavailable",
+            stage="terminal_attach",
+            details=_diagnostic_details(config),
+        )
     timeframe_name = mt5_loader._INTERVAL_MAP.get(interval)
     if timeframe_name is None:
-        raise _fail(f"unsupported MT5 timeframe {interval!r}")
+        raise _fail(
+            f"unsupported MT5 timeframe {interval!r}",
+            error_code="mt5_snapshot_invalid_schema",
+            stage="timeframe_validation",
+            details=_diagnostic_details(config),
+        )
     resolved_symbol = mt5_loader._resolve_broker_symbol(mt5, requested_symbol)
     if not resolved_symbol:
-        raise _fail(f"broker symbol resolution failed for {requested_symbol!r}")
+        raise _fail(
+            f"broker symbol resolution failed for {requested_symbol!r}",
+            error_code="mt5_symbol_resolution_failed",
+            stage="symbol_resolution",
+            details=_diagnostic_details(config, timeframe=timeframe_name),
+        )
 
     loader = mt5_loader.DataLoader()
-    raw_frame = loader._fetch_one(
-        requested_symbol, start_date, end_date, timeframe_name, include_spread=True
-    )
-    frame = _validate_frame(raw_frame)
+    try:
+        raw_frame = loader._fetch_one(
+            requested_symbol,
+            start_date,
+            end_date,
+            timeframe_name,
+            include_spread=True,
+            diagnostic=True,
+            interval=interval,
+        )
+    except mt5_loader.MT5AcquisitionError as exc:
+        details = _diagnostic_details(config, timeframe=timeframe_name, resolved_symbol=resolved_symbol)
+        details.update(exc.details)
+        raise _fail(
+            str(exc),
+            error_code=exc.error_code,
+            stage=exc.stage,
+            details=details,
+        ) from exc
+    try:
+        frame = _validate_frame(raw_frame)
+    except MT5SnapshotError as exc:
+        details = _diagnostic_details(
+            config,
+            timeframe=timeframe_name,
+            resolved_symbol=resolved_symbol,
+        )
+        details.update(exc.details)
+        raise _fail(
+            exc.message,
+            error_code=exc.error_code,
+            stage=exc.stage,
+            details=details,
+        ) from exc
     symbol_info = mt5.symbol_info(resolved_symbol)
     if symbol_info is None:
         raise _fail("broker symbol metadata is unavailable for cost normalization")

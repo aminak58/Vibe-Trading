@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -56,6 +57,57 @@ _init_state: bool | None = None
 
 #: base symbol → resolved broker symbol memo.
 _symbol_cache: dict[str, str] = {}
+
+
+class MT5AcquisitionError(RuntimeError):
+    """Structured failure retained only by strict snapshot acquisition."""
+
+    def __init__(self, error_code: str, stage: str, message: str, details: dict[str, Any]) -> None:
+        self.error_code = error_code
+        self.stage = stage
+        self.details = dict(details)
+        super().__init__(message)
+
+
+def _sanitize_exception_message(exc: Exception) -> str:
+    """Keep a bounded, credential-safe detail for an acquisition diagnostic."""
+    message = " ".join(str(exc).split())
+    message = re.sub(r"(?i)(password|token|secret)\s*=\s*\S+", r"\1=[redacted]", message)
+    return message[:240] or exc.__class__.__name__
+
+
+def _acquisition_error(
+    error_code: str,
+    stage: str,
+    message: str,
+    *,
+    code: str,
+    interval: str | None,
+    timeframe_name: str,
+    start_date: str,
+    end_date: str,
+    resolved_symbol: str | None = None,
+    raw_row_count: int | None = None,
+    filtered_row_count: int | None = None,
+    exception: Exception | None = None,
+) -> MT5AcquisitionError:
+    details: dict[str, Any] = {
+        "requested_symbol": code,
+        "codes": [code],
+        "resolved_symbol": resolved_symbol,
+        "interval": interval,
+        "timeframe": timeframe_name,
+        "requested_start": start_date,
+        "requested_end": end_date,
+    }
+    if raw_row_count is not None:
+        details["raw_row_count"] = raw_row_count
+    if filtered_row_count is not None:
+        details["filtered_row_count"] = filtered_row_count
+    if exception is not None:
+        details["exception_type"] = type(exception).__name__
+        details["exception_message"] = _sanitize_exception_message(exception)
+    return MT5AcquisitionError(error_code, stage, message, details)
 
 
 def _import_mt5() -> ModuleType | None:
@@ -244,14 +296,43 @@ class DataLoader:
         timeframe_name: str,
         *,
         include_spread: bool = False,
+        diagnostic: bool = False,
+        interval: str | None = None,
     ) -> pd.DataFrame | None:
         """Fetch one symbol from the terminal (``None`` on any failure)."""
+        def fail(error: MT5AcquisitionError) -> pd.DataFrame | None:
+            if diagnostic:
+                raise error
+            return None
+
         mt5 = _import_mt5()
         if mt5 is None or not _ensure_initialized():
-            return None
+            return fail(
+                _acquisition_error(
+                    "mt5_terminal_unavailable",
+                    "terminal_attach",
+                    "MT5 terminal is unavailable.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
         name = _resolve_broker_symbol(mt5, code)
         if name is None:
-            return None
+            return fail(
+                _acquisition_error(
+                    "mt5_symbol_resolution_failed",
+                    "symbol_resolution",
+                    "MT5 broker symbol resolution failed.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+            )
         try:
             mt5.symbol_select(name, True)
             timeframe = getattr(mt5, timeframe_name)
@@ -262,5 +343,70 @@ class DataLoader:
             rates = mt5.copy_rates_range(name, timeframe, date_from, date_to)
         except Exception as exc:  # noqa: BLE001 - terminal hiccups degrade, not raise
             logger.warning("mt5: rates fetch failed for %s (%s): %s", code, name, exc)
-            return None
-        return _rates_to_frame(rates, start_date, end_date, include_spread=include_spread)
+            return fail(
+                _acquisition_error(
+                    "mt5_copy_rates_exception",
+                    "copy_rates_range",
+                    "MT5 copy_rates_range raised an exception.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolved_symbol=name,
+                    exception=exc,
+                )
+            )
+        if rates is None or len(rates) == 0:
+            return fail(
+                _acquisition_error(
+                    "mt5_copy_rates_empty",
+                    "copy_rates_range",
+                    "MT5 copy_rates_range returned no bars.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolved_symbol=name,
+                    raw_row_count=0,
+                )
+            )
+        raw = pd.DataFrame(rates)
+        raw_row_count = len(raw)
+        required_columns = {"time", "open", "high", "low", "close"}
+        if include_spread:
+            required_columns.add("spread")
+        if not required_columns.issubset(raw.columns):
+            return fail(
+                _acquisition_error(
+                    "mt5_snapshot_invalid_schema",
+                    "frame_schema",
+                    "MT5 bars do not satisfy the required snapshot schema.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolved_symbol=name,
+                    raw_row_count=raw_row_count,
+                )
+            )
+        frame = _rates_to_frame(rates, start_date, end_date, include_spread=include_spread)
+        if frame is None:
+            return fail(
+                _acquisition_error(
+                    "mt5_rows_filtered_to_zero",
+                    "frame_filter",
+                    "MT5 bars were filtered to zero usable rows for the requested range.",
+                    code=code,
+                    interval=interval,
+                    timeframe_name=timeframe_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    resolved_symbol=name,
+                    raw_row_count=raw_row_count,
+                    filtered_row_count=0,
+                )
+            )
+        return frame

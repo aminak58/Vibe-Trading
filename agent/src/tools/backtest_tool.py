@@ -142,7 +142,7 @@ def run_backtest(
     # intentionally fail-closed: no loader fallback is allowed here or below.
     if config["source"] == "mt5":
         try:
-            from backtest.mt5_snapshot import MANIFEST_RELATIVE_PATH, prepare_mt5_snapshot
+            from backtest.mt5_snapshot import MANIFEST_RELATIVE_PATH, MT5SnapshotError, prepare_mt5_snapshot
 
             manifest = prepare_mt5_snapshot(run_path, config)
             config["mt5_snapshot_manifest"] = MANIFEST_RELATIVE_PATH.as_posix()
@@ -151,6 +151,17 @@ def run_backtest(
             # it must not look up broker costs or retain request-time defaults.
             config["cost_model"] = manifest["cost_model"]
             _persist_config(config_path, config)
+        except MT5SnapshotError as exc:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error_code": exc.error_code,
+                    "stage": exc.stage,
+                    "diagnostic": exc.details,
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:  # noqa: BLE001 - surface one strict handoff envelope
             return json.dumps(
                 {"status": "error", "error": f"MT5-backed data acquisition/handoff failure: {exc}"},

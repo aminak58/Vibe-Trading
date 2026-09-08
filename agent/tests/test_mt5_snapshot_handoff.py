@@ -56,6 +56,233 @@ def _bars() -> pd.DataFrame:
     )
 
 
+class _DiagnosticMT5:
+    TIMEFRAME_M5 = 5
+
+    def __init__(self, *, rates=None, rates_error: Exception | None = None) -> None:
+        self._rates = rates
+        self._rates_error = rates_error
+
+    def symbol_info(self, _symbol: str):
+        return SimpleNamespace(point=0.01)
+
+    def symbol_select(self, _symbol: str, _visible: bool) -> bool:
+        return True
+
+    def copy_rates_range(self, _symbol, _timeframe, _start, _end):
+        if self._rates_error is not None:
+            raise self._rates_error
+        return self._rates
+
+    def account_info(self):
+        return SimpleNamespace(server="Diagnostic-MT5")
+
+
+def _diagnostic_rates(*, timestamp: str = "2026-08-24T00:00:00Z", include_close: bool = True):
+    row = {
+        "time": int(pd.Timestamp(timestamp).timestamp()),
+        "open": 2300.0,
+        "high": 2301.0,
+        "low": 2299.0,
+        "tick_volume": 10,
+        "spread": 12,
+    }
+    if include_close:
+        row["close"] = 2300.5
+    return [row]
+
+
+def _install_diagnostic_mt5(monkeypatch: pytest.MonkeyPatch, mt5: _DiagnosticMT5) -> None:
+    from backtest.loaders import mt5_loader
+
+    monkeypatch.setattr(mt5_loader, "_import_mt5", lambda: mt5)
+    monkeypatch.setattr(mt5_loader, "_ensure_initialized", lambda: True)
+    monkeypatch.setattr(mt5_loader, "_resolve_broker_symbol", lambda _mt5, _code: "XAUUSD_o")
+
+
+def _assert_diagnostic(
+    error: MT5SnapshotError,
+    *,
+    code: str,
+    stage: str,
+    resolved_symbol: str | None,
+) -> None:
+    assert error.error_code == code
+    assert error.stage == stage
+    assert error.details["requested_symbol"] == "XAUUSD"
+    assert error.details["codes"] == ["XAUUSD"]
+    assert error.details["interval"] == "5m"
+    assert error.details["requested_start"] == "2026-08-24"
+    assert error.details["requested_end"] == "2026-08-28"
+    assert error.details["resolved_symbol"] == resolved_symbol
+    assert f"[{code}]" in str(error)
+
+
+def test_snapshot_reports_terminal_unavailable_with_structured_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtest.loaders import mt5_loader
+
+    monkeypatch.setattr(mt5_loader, "_import_mt5", lambda: None)
+    monkeypatch.setattr(mt5_loader, "_ensure_initialized", lambda: False)
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_terminal_unavailable",
+        stage="terminal_attach",
+        resolved_symbol=None,
+    )
+
+
+def test_snapshot_reports_symbol_resolution_failure_with_structured_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backtest.loaders import mt5_loader
+
+    mt5 = _DiagnosticMT5(rates=_diagnostic_rates())
+    _install_diagnostic_mt5(monkeypatch, mt5)
+    monkeypatch.setattr(mt5_loader, "_resolve_broker_symbol", lambda _mt5, _code: None)
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_symbol_resolution_failed",
+        stage="symbol_resolution",
+        resolved_symbol=None,
+    )
+
+
+def test_snapshot_reports_copy_rates_exception_with_sanitized_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_diagnostic_mt5(monkeypatch, _DiagnosticMT5(rates_error=RuntimeError("terminal IPC failed")))
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_copy_rates_exception",
+        stage="copy_rates_range",
+        resolved_symbol="XAUUSD_o",
+    )
+    assert raised.value.details["exception_type"] == "RuntimeError"
+    assert raised.value.details["exception_message"] == "terminal IPC failed"
+
+
+def test_snapshot_reports_empty_copy_rates_response(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_diagnostic_mt5(monkeypatch, _DiagnosticMT5(rates=[]))
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_copy_rates_empty",
+        stage="copy_rates_range",
+        resolved_symbol="XAUUSD_o",
+    )
+    assert raised.value.details["raw_row_count"] == 0
+
+
+def test_snapshot_reports_rows_filtered_to_zero(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_diagnostic_mt5(
+        monkeypatch,
+        _DiagnosticMT5(rates=_diagnostic_rates(timestamp="2026-01-01T00:00:00Z")),
+    )
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_rows_filtered_to_zero",
+        stage="frame_filter",
+        resolved_symbol="XAUUSD_o",
+    )
+    assert raised.value.details["raw_row_count"] == 1
+    assert raised.value.details["filtered_row_count"] == 0
+
+
+def test_snapshot_reports_invalid_schema_without_changing_readable_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_diagnostic_mt5(monkeypatch, _DiagnosticMT5(rates=_diagnostic_rates(include_close=False)))
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_snapshot_invalid_schema",
+        stage="frame_schema",
+        resolved_symbol="XAUUSD_o",
+    )
+    assert "MT5-backed data acquisition/handoff failure" in str(raised.value)
+
+
+def test_snapshot_reports_missing_ohlc_column_as_invalid_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rates = _diagnostic_rates()
+    del rates[0]["open"]
+    _install_diagnostic_mt5(monkeypatch, _DiagnosticMT5(rates=rates))
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_snapshot_invalid_schema",
+        stage="frame_schema",
+        resolved_symbol="XAUUSD_o",
+    )
+
+
+def test_snapshot_validation_error_retains_request_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mt5 = _DiagnosticMT5(rates=_diagnostic_rates())
+    _install_diagnostic_mt5(monkeypatch, mt5)
+    invalid_frame = _bars().copy()
+    invalid_frame.index = invalid_frame.index.tz_localize(None)
+    from backtest.loaders import mt5_loader
+
+    monkeypatch.setattr(mt5_loader.DataLoader, "_fetch_one", lambda *args, **kwargs: invalid_frame)
+
+    with pytest.raises(MT5SnapshotError) as raised:
+        prepare_mt5_snapshot(tmp_path, _config())
+
+    _assert_diagnostic(
+        raised.value,
+        code="mt5_snapshot_invalid_schema",
+        stage="snapshot_validation",
+        resolved_symbol="XAUUSD_o",
+    )
+
+
+def test_backtest_tool_exposes_structured_mt5_acquisition_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "code").mkdir()
+    (tmp_path / "code" / "signal_engine.py").write_text("class SignalEngine: pass\n", encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps(_config()), encoding="utf-8")
+    _install_diagnostic_mt5(monkeypatch, _DiagnosticMT5(rates=[]))
+    monkeypatch.setattr(backtest_tool, "safe_run_dir", lambda path: Path(path))
+
+    result = json.loads(backtest_tool.run_backtest(str(tmp_path)))
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "mt5_copy_rates_empty"
+    assert result["stage"] == "copy_rates_range"
+    assert result["diagnostic"]["requested_symbol"] == "XAUUSD"
+
+
 @pytest.fixture
 def prepared_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from backtest.loaders import mt5_loader
