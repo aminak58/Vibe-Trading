@@ -237,6 +237,21 @@ class _BacktestSpyTool(BaseTool):
         return json.dumps({"status": "ok", "mock": "backtest-ran"})
 
 
+class _AcquisitionFailureSpyTool(_BacktestSpyTool):
+    """A delegated strict acquisition failure with no package mutation."""
+
+    def execute(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        return json.dumps(
+            {
+                "status": "error",
+                "error_code": "mt5_copy_rates_empty",
+                "stage": "copy_rates_range",
+                "diagnostic": {"raw_row_count": 0},
+            }
+        )
+
+
 class _ScriptedWorkerLLM:
     """Small ChatLLM stand-in that records messages across worker turns."""
 
@@ -478,3 +493,98 @@ def test_strict_worker_valid_package_delegates_backtest_once(monkeypatch, tmp_pa
     assert len(spy.calls) == 1
     assert spy.calls[0]["run_dir"] == str(artifact_dir)
     assert spy.calls[0]["__execution_identity"] == _identity()
+
+
+def test_strict_worker_suppresses_second_identical_acquisition_failure(monkeypatch, tmp_path: Path) -> None:
+    """A terminal strict acquisition failure must delegate only its first call."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(artifact_dir, _valid_config())
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="The strict acquisition failure was reported once."),
+        ]
+    )
+    spy = _AcquisitionFailureSpyTool()
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert len(spy.calls) == 1
+    tool_messages = "\n".join(_all_worker_tool_messages(llm))
+    assert "strict_backtest_acquisition_failure_already_seen" in tool_messages
+    assert "mt5_copy_rates_empty" in tool_messages
+
+
+def test_strict_worker_emits_structured_events_for_acquisition_suppression(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Both the original acquisition failure and suppression must be auditable."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(artifact_dir, _valid_config())
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="The strict acquisition failure was reported once."),
+        ]
+    )
+    events = []
+
+    _run_strict_worker(
+        monkeypatch,
+        tmp_path,
+        llm,
+        _AcquisitionFailureSpyTool(),
+        event_callback=events.append,
+    )
+
+    results = [
+        event.data
+        for event in events
+        if event.type == "tool_result" and event.data.get("tool") == "backtest"
+    ]
+    assert [result["error_code"] for result in results] == [
+        "mt5_copy_rates_empty",
+        "strict_backtest_acquisition_failure_already_seen",
+    ]
+    assert results[1]["original_error_code"] == "mt5_copy_rates_empty"
+
+
+def test_non_strict_worker_does_not_suppress_repeated_acquisition_failures(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The strict acquisition guard must not change generic worker behavior."""
+    registry = ToolRegistry()
+    spy = _AcquisitionFailureSpyTool()
+    registry.register(spy)
+    llm = _ScriptedWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="Generic worker reported both tool failures."),
+        ]
+    )
+    monkeypatch.setattr(worker_mod, "build_swarm_registry", lambda *args, **kwargs: registry)
+    monkeypatch.setattr(worker_mod, "ChatLLM", llm)
+
+    run_worker(
+        agent_spec=_strict_backtest_agent(),
+        task=_strict_backtest_task(),
+        upstream_summaries={},
+        user_vars={"goal": "Generic backtest."},
+        run_dir=tmp_path,
+        execution_identity=None,
+    )
+
+    assert len(spy.calls) == 2

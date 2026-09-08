@@ -6,6 +6,7 @@ keeping the worker self-contained and the agent core unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shutil
@@ -60,6 +61,16 @@ _WORKER_FILE_TOOLS = {"write_file", "edit_file"}
 _WRITE_FILE_PATH_KEYS = ("path", "file_path", "filepath", "filename", "file")
 _FACTOR_PANEL_ARTIFACT = "factor_input.factor_panel"
 _FORWARD_RETURN_PANEL_ARTIFACT = "factor_input.forward_return_panel"
+_TERMINAL_STRICT_BACKTEST_ACQUISITION_ERRORS = frozenset(
+    {
+        "mt5_terminal_unavailable",
+        "mt5_symbol_resolution_failed",
+        "mt5_copy_rates_exception",
+        "mt5_copy_rates_empty",
+        "mt5_rows_filtered_to_zero",
+        "mt5_snapshot_invalid_schema",
+    }
+)
 
 
 def _strict_backtest_bundle_for_worker(
@@ -926,6 +937,7 @@ def _run_worker_impl(
             }
         )
     strict_preflight_failed = False
+    strict_acquisition_failure: dict[str, str] | None = None
 
     t0 = time.monotonic()
     iteration = 0
@@ -1307,6 +1319,35 @@ def _run_worker_impl(
                     })
                     messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
                     continue
+                current_fingerprint = _strict_backtest_package_fingerprint(artifact_dir, tc.arguments)
+                if (
+                    strict_acquisition_failure is not None
+                    and strict_acquisition_failure["fingerprint"] == current_fingerprint
+                ):
+                    result = json.dumps(
+                        {
+                            "status": "error",
+                            "error_code": "strict_backtest_acquisition_failure_already_seen",
+                            "original_error_code": strict_acquisition_failure["error_code"],
+                            "stage": strict_acquisition_failure["stage"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    _emit(event_callback, "tool_result", agent_id, task_id, {
+                        "tool": tc.name,
+                        "call_id": tc.id,
+                        "elapsed_ms": int((time.monotonic() - tc_start) * 1000),
+                        "status": "error",
+                        "error_code": "strict_backtest_acquisition_failure_already_seen",
+                        "original_error_code": strict_acquisition_failure["error_code"],
+                        "stage": strict_acquisition_failure["stage"],
+                        "suppression_code": "strict_backtest_acquisition_failure_already_seen",
+                        "iteration": iteration,
+                        "result_preview": _preview_tool_result(result),
+                        **mcp_meta,
+                    })
+                    messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
+                    continue
                 preflight = validate_strict_backtest_package(artifact_dir, strict_backtest_bundle)
                 if preflight is not None:
                     strict_preflight_failed = True
@@ -1383,23 +1424,36 @@ def _run_worker_impl(
                 ):
                     result = registry.execute(tc.name, args)
             result_is_error = _is_error_result(result)
+            acquisition_failure = (
+                _terminal_strict_acquisition_failure(result)
+                if tc.name == "backtest" and strict_backtest_bundle is not None
+                else None
+            )
+            if acquisition_failure is not None:
+                strict_acquisition_failure = {
+                    **acquisition_failure,
+                    "fingerprint": _strict_backtest_package_fingerprint(artifact_dir, tc.arguments),
+                }
             if tc.name != "load_skill" and not result_is_error:
                 data_tool_calls += 1
             tc_elapsed = time.monotonic() - tc_start
+            event_data = {
+                "tool": tc.name,
+                "call_id": tc.id,
+                "elapsed_ms": int(tc_elapsed * 1000),
+                "status": "error" if result_is_error else "ok",
+                "iteration": iteration,
+                "result_preview": _preview_tool_result(result),
+                **mcp_meta,
+            }
+            if acquisition_failure is not None:
+                event_data.update(acquisition_failure)
             _emit(
                 event_callback,
                 "tool_result",
                 agent_id,
                 task_id,
-                {
-                    "tool": tc.name,
-                    "call_id": tc.id,
-                    "elapsed_ms": int(tc_elapsed * 1000),
-                    "status": "error" if result_is_error else "ok",
-                    "iteration": iteration,
-                    "result_preview": _preview_tool_result(result),
-                    **mcp_meta,
-                },
+                event_data,
             )
             messages.append(
                 ContextBuilder.format_tool_result(
@@ -1581,6 +1635,38 @@ def _is_error_result(result: str) -> bool:
     if parsed.get("status") == "error":
         return True
     return parsed.get("ok") is False or parsed.get("success") is False
+
+
+def _strict_backtest_package_fingerprint(artifact_dir: Path, arguments: dict[str, Any]) -> str:
+    """Hash the immutable parts of one strict delegated backtest request."""
+    digest = hashlib.sha256()
+    digest.update(str(artifact_dir.resolve()).encode("utf-8"))
+    digest.update(json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8"))
+    for relative_path in ("config.json", "code/signal_engine.py"):
+        path = artifact_dir / relative_path
+        digest.update(relative_path.encode("utf-8"))
+        try:
+            digest.update(path.read_bytes())
+        except OSError:
+            digest.update(b"[missing]")
+    return digest.hexdigest()
+
+
+def _terminal_strict_acquisition_failure(result: str) -> dict[str, str] | None:
+    """Return a repeat-suppression record for terminal strict MT5 failures."""
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "error":
+        return None
+    error_code = payload.get("error_code")
+    if error_code not in _TERMINAL_STRICT_BACKTEST_ACQUISITION_ERRORS:
+        return None
+    return {
+        "error_code": error_code,
+        "stage": str(payload.get("stage") or ""),
+    }
 
 
 def _classify_deliverable(
