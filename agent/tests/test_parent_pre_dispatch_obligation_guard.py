@@ -128,6 +128,23 @@ class _StrictMt5ResolverTool(BaseTool):
         )
 
 
+class _FailingStrictMt5ResolverTool(BaseTool):
+    """Represent a resolver implementation that ran and returned an error."""
+
+    name = "search_symbol"
+    description = "test-only failing MT5 resolver"
+    parameters: dict[str, Any] = {"type": "object", "properties": {}}
+
+    def execute(self, **kwargs: Any) -> str:
+        return json.dumps(
+            {
+                "status": "error",
+                "error_code": "resolver_unavailable",
+                "message": "resolver implementation failed",
+            }
+        )
+
+
 class _RecordingSwarmTool(BaseTool):
     name = "run_swarm"
     description = "test-only Swarm dispatcher"
@@ -240,6 +257,30 @@ class _ResolveThenAdvisoryLLM:
                     id=f"advisory-{self.calls}",
                     name=self.advisory_tool,
                     arguments={},
+                )
+            ]
+        )
+
+    def chat(self, messages, **kwargs):
+        return _Response()
+
+
+class _WrongAliasThenStopLLM:
+    """Request a resolved alias where the strict resolver requires the request symbol."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def stream_chat(self, messages, tools=None, **kwargs):
+        self.calls += 1
+        if tools is None or self.calls > 1:
+            return _Response(content="Stop after the denied resolver attempt.")
+        return _Response(
+            tool_calls=[
+                SimpleNamespace(
+                    id="wrong-resolver-alias",
+                    name="search_symbol",
+                    arguments={"query": "XAUUSD_o", "source": "mt5"},
                 )
             ]
         )
@@ -471,6 +512,54 @@ def test_verified_strict_swarm_dispatches_before_advisory_market_data(
     assert swarm.calls[0]["prompt"] == STRICT_SWARM_REQUEST
     assert swarm.calls[0]["__execution_identity"].resolutions[0].resolved_symbol == "XAUUSD_o"
     assert result["status"] == "failed"
+
+
+def test_authorization_blocked_resolver_does_not_reject_pending_identity(
+    tmp_path: Path,
+) -> None:
+    """A resolver implementation that never ran cannot reject strict identity."""
+    registry = ToolRegistry()
+    registry.register(_StrictMt5ResolverTool())
+    agent = _agent(tmp_path, _WrongAliasThenStopLLM(), registry, max_iterations=3)
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    identity = json.loads(
+        (tmp_path / "run" / "execution_identity.json").read_text(encoding="utf-8")
+    )
+    assert identity["status"] == "partially_specified"
+    assert identity["resolutions"] == []
+    assert result["reason"] == "swarm_required_pre_dispatch_incomplete"
+
+    tool_result = next(
+        event
+        for event in TraceWriter.read(tmp_path / "run")
+        if event.get("type") == "tool_result"
+        and event.get("call_id") == "wrong-resolver-alias"
+    )
+    payload = json.loads(tool_result["result"])
+    assert payload["error_code"] == "denied_by_execution_identity"
+    assert payload["executed"] is False
+    assert payload["authoritative_result"] is False
+    assert payload["block_stage"] == "authorization"
+
+
+def test_executed_resolver_failure_still_rejects_pending_identity(
+    tmp_path: Path,
+) -> None:
+    """The non-mutation rule must not hide failures from a resolver that ran."""
+    registry = ToolRegistry()
+    registry.register(_FailingStrictMt5ResolverTool())
+    agent = _agent(tmp_path, _ResolveThenAdvisoryLLM("get_market_data"), registry)
+
+    result = agent.run(user_message=STRICT_SWARM_REQUEST)
+
+    identity = json.loads(
+        (tmp_path / "run" / "execution_identity.json").read_text(encoding="utf-8")
+    )
+    assert identity["status"] == "rejected"
+    assert identity["resolutions"] == []
+    assert result["reason"] == "strict_execution_identity_unavailable"
 
 
 def test_owned_running_swarm_quiesces_parent_before_advisory_tools(

@@ -3204,6 +3204,26 @@ class AgentLoop:
                 "blocked": True,
             }
         )
+        try:
+            blocked_payload = json.loads(result)
+        except (TypeError, ValueError):
+            blocked_payload = {"status": "error", "message": str(result)}
+        block_stage = (
+            "authorization"
+            if isinstance(blocked_payload, dict)
+            and blocked_payload.get("error_code") == "denied_by_execution_identity"
+            else "pre_execution_gate"
+        )
+        if isinstance(blocked_payload, dict):
+            blocked_payload.update(
+                {
+                    "executed": False,
+                    "authoritative_result": False,
+                    "block_stage": block_stage,
+                }
+            )
+            result = json.dumps(blocked_payload, ensure_ascii=False)
+
         self._finalize_tool_result(
             tc,
             result,
@@ -3215,6 +3235,9 @@ class AgentLoop:
             iteration,
             update_memory=False,
             update_ownership=False,
+            executed=False,
+            authoritative_result=False,
+            block_stage=block_stage,
         )
 
     def _batch_execute(
@@ -3786,6 +3809,9 @@ class AgentLoop:
         *,
         update_memory: bool = True,
         update_ownership: bool = True,
+        executed: bool = True,
+        authoritative_result: bool = True,
+        block_stage: str | None = None,
     ) -> None:
         """Record a tool result: update memory, append message, write trace, emit event.
 
@@ -3799,6 +3825,10 @@ class AgentLoop:
             react_trace: React trace list.
             iteration: Current iteration.
             update_memory: Whether this call reached the tool implementation.
+            update_ownership: Whether Swarm ownership may be updated.
+            executed: Whether the tool implementation actually ran.
+            authoritative_result: Whether ledgers may ingest this result as tool evidence.
+            block_stage: Pre-execution stage that blocked the call, when applicable.
         """
         if update_memory:
             self._update_memory(tc.name)
@@ -3824,7 +3854,7 @@ class AgentLoop:
             if tc.name in {"write_file", "edit_file"}:
                 self._record_written_target(tc.arguments)
 
-        if self._grounding is not None:
+        if authoritative_result and self._grounding is not None:
             self._grounding.ingest_tool_result(
                 tool_name=tc.name,
                 arguments=_normalize_tool_run_dir(tc.arguments, self.memory.run_dir),
@@ -3842,9 +3872,9 @@ class AgentLoop:
                     }
                 )
 
-        if self._execution_identity is not None and tc.name == "read_document":
+        if authoritative_result and self._execution_identity is not None and tc.name == "read_document":
             self._execution_identity.ingest_document_result(result, call_id=tc.id)
-        elif self._execution_identity is not None and tc.name == "search_symbol":
+        elif authoritative_result and self._execution_identity is not None and tc.name == "search_symbol":
             self._execution_identity.ingest_resolver_result(
                 arguments=_normalize_tool_run_dir(tc.arguments, self.memory.run_dir),
                 result=result,
@@ -3900,6 +3930,9 @@ class AgentLoop:
                 "elapsed_ms": elapsed_ms,
                 "preview": preview,
                 "call_id": tc.id,
+                "executed": executed,
+                "authoritative_result": authoritative_result,
+                **({"block_stage": block_stage} if block_stage else {}),
             },
         )
 
