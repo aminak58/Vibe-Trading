@@ -936,7 +936,7 @@ def _run_worker_impl(
                 ),
             }
         )
-    strict_preflight_failed = False
+    strict_preflight_failure: dict[str, str] | None = None
     strict_acquisition_failure: dict[str, str] | None = None
 
     t0 = time.monotonic()
@@ -1301,10 +1301,20 @@ def _run_worker_impl(
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
+            strict_preflight_fingerprint: str | None = None
+            strict_preflight_revalidated = False
             if tc.name == "backtest" and strict_backtest_bundle is not None:
-                if strict_preflight_failed:
+                strict_preflight_fingerprint = _strict_backtest_package_fingerprint(artifact_dir, tc.arguments)
+                if (
+                    strict_preflight_failure is not None
+                    and strict_preflight_failure["fingerprint"] == strict_preflight_fingerprint
+                ):
                     result = json.dumps(
-                        {"status": "error", "error_code": "strict_backtest_preflight_already_failed"},
+                        {
+                            "status": "error",
+                            "error_code": "strict_backtest_preflight_already_failed",
+                            "original_error_code": strict_preflight_failure["error_code"],
+                        },
                         ensure_ascii=False,
                     )
                     _emit(event_callback, "tool_result", agent_id, task_id, {
@@ -1313,16 +1323,19 @@ def _run_worker_impl(
                         "elapsed_ms": int((time.monotonic() - tc_start) * 1000),
                         "status": "error",
                         "error_code": "strict_backtest_preflight_already_failed",
+                        "original_error_code": strict_preflight_failure["error_code"],
+                        "preflight_fingerprint": strict_preflight_fingerprint,
+                        "original_failure_fingerprint": strict_preflight_failure["fingerprint"],
+                        "suppression_code": "strict_backtest_preflight_already_failed",
                         "iteration": iteration,
                         "result_preview": _preview_tool_result(result),
                         **mcp_meta,
                     })
                     messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
                     continue
-                current_fingerprint = _strict_backtest_package_fingerprint(artifact_dir, tc.arguments)
                 if (
                     strict_acquisition_failure is not None
-                    and strict_acquisition_failure["fingerprint"] == current_fingerprint
+                    and strict_acquisition_failure["fingerprint"] == strict_preflight_fingerprint
                 ):
                     result = json.dumps(
                         {
@@ -1350,7 +1363,10 @@ def _run_worker_impl(
                     continue
                 preflight = validate_strict_backtest_package(artifact_dir, strict_backtest_bundle)
                 if preflight is not None:
-                    strict_preflight_failed = True
+                    strict_preflight_failure = {
+                        "fingerprint": strict_preflight_fingerprint,
+                        "error_code": preflight.get("error_code", "strict_backtest_preflight_failed"),
+                    }
                     result = json.dumps(preflight, ensure_ascii=False)
                     _emit(event_callback, "tool_result", agent_id, task_id, {
                         "tool": tc.name,
@@ -1358,12 +1374,16 @@ def _run_worker_impl(
                         "elapsed_ms": int((time.monotonic() - tc_start) * 1000),
                         "status": "error",
                         "error_code": preflight.get("error_code", "strict_backtest_preflight_failed"),
+                        "preflight_fingerprint": strict_preflight_fingerprint,
+                        "preflight_status": "failed",
                         "iteration": iteration,
                         "result_preview": _preview_tool_result(result),
                         **mcp_meta,
                     })
                     messages.append(ContextBuilder.format_tool_result(tc.id, tc.name, result))
                     continue
+                strict_preflight_revalidated = strict_preflight_failure is not None
+                strict_preflight_failure = None
             if tc.name == "backtest" and execution_identity is not None:
                 # Not model-visible and never sourced from task prose.  The
                 # BacktestTool validates generated config.json at this final
@@ -1448,6 +1468,13 @@ def _run_worker_impl(
             }
             if acquisition_failure is not None:
                 event_data.update(acquisition_failure)
+            if strict_preflight_fingerprint is not None:
+                event_data.update(
+                    {
+                        "preflight_fingerprint": strict_preflight_fingerprint,
+                        "preflight_status": "revalidated" if strict_preflight_revalidated else "passed",
+                    }
+                )
             _emit(
                 event_callback,
                 "tool_result",

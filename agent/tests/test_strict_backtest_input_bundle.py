@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -270,6 +271,29 @@ class _ScriptedWorkerLLM:
         return self._responses.pop(0)
 
 
+class _PackageMutatingWorkerLLM(_ScriptedWorkerLLM):
+    """Simulate a worker repairing its package after a tool-visible failure."""
+
+    def __init__(
+        self, responses: list[LLMResponse], *, before_response: dict[int, Callable[[], None]]
+    ) -> None:
+        super().__init__(responses)
+        self._before_response = before_response
+
+    def stream_chat(self, messages, tools=None, on_text_chunk=None, timeout=None, **kwargs) -> LLMResponse:
+        response_number = len(self.received_messages) + 1
+        callback = self._before_response.get(response_number)
+        if callback is not None:
+            callback()
+        return super().stream_chat(
+            messages,
+            tools=tools,
+            on_text_chunk=on_text_chunk,
+            timeout=timeout,
+            **kwargs,
+        )
+
+
 def _strict_backtest_agent() -> SwarmAgentSpec:
     return SwarmAgentSpec(
         id="backtester",
@@ -425,6 +449,184 @@ def test_strict_worker_preflight_failure_suppresses_repeated_backtest_delegation
     assert "strict_backtest_preflight_already_failed" in tool_messages
 
 
+def test_strict_worker_revalidates_a_repaired_package_before_single_delegation(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A changed strict package must escape only its old preflight failure.
+
+    The production bug was a worker-wide ``strict_preflight_failed`` flag:
+    after the model wrote the required ``codes`` field, the repaired package
+    was still suppressed without another validation or delegated backtest.
+    """
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        {
+            "symbol": "XAUUSD_o",
+            "source": "mt5",
+            "start_date": "2026-08-20",
+            "end_date": "2026-09-07",
+        },
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+
+    def repair_config() -> None:
+        _write_config(artifact_dir, _valid_config())
+
+    llm = _PackageMutatingWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="invalid", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="repaired", name="backtest", arguments={})]),
+            LLMResponse(content="The repaired strict package reached the delegated backtest."),
+        ],
+        before_response={2: repair_config},
+    )
+    spy = _BacktestSpyTool()
+    original_validate = worker_mod.validate_strict_backtest_package
+    validation_calls: list[Path] = []
+
+    def tracked_validate(path: Path, bundle):
+        validation_calls.append(path)
+        return original_validate(path, bundle)
+
+    monkeypatch.setattr(worker_mod, "validate_strict_backtest_package", tracked_validate)
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert len(validation_calls) == 2
+    assert len(spy.calls) == 1
+    tool_messages = "\n".join(_all_worker_tool_messages(llm))
+    assert "invalid_backtest_config_identity" in tool_messages
+    assert "strict_backtest_preflight_already_failed" not in tool_messages
+
+
+def test_strict_worker_revalidates_repaired_dates_without_expanding_date_grammar(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Repairing an invalid ISO timestamp to date-only form may reach backtest."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        _valid_config() | {"start_date": "2026-08-20T00:00:00Z"},
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+
+    llm = _PackageMutatingWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="invalid", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="repaired", name="backtest", arguments={})]),
+            LLMResponse(content="The repaired date-only package reached the delegated backtest."),
+        ],
+        before_response={2: lambda: _write_config(artifact_dir, _valid_config())},
+    )
+    spy = _BacktestSpyTool()
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert len(spy.calls) == 1
+    tool_messages = "\n".join(_all_worker_tool_messages(llm))
+    assert "invalid_window_config" in tool_messages
+
+
+def test_strict_worker_keeps_same_preflight_failure_when_only_untracked_file_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Changing unrelated worker output must not evade identical-package suppression."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        {
+            "symbol": "XAUUSD_o",
+            "source": "mt5",
+            "start_date": "2026-08-20",
+            "end_date": "2026-09-07",
+        },
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _PackageMutatingWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="first", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="second", name="backtest", arguments={})]),
+            LLMResponse(content="The same invalid package remained blocked."),
+        ],
+        before_response={2: lambda: (artifact_dir / "notes.txt").write_text("unrelated", encoding="utf-8")},
+    )
+    spy = _BacktestSpyTool()
+    original_validate = worker_mod.validate_strict_backtest_package
+    validation_calls: list[Path] = []
+
+    def tracked_validate(path: Path, bundle):
+        validation_calls.append(path)
+        return original_validate(path, bundle)
+
+    monkeypatch.setattr(worker_mod, "validate_strict_backtest_package", tracked_validate)
+
+    _run_strict_worker(monkeypatch, tmp_path, llm, spy)
+
+    assert spy.calls == []
+    assert len(validation_calls) == 1
+    tool_messages = "\n".join(_all_worker_tool_messages(llm))
+    assert "strict_backtest_preflight_already_failed" in tool_messages
+
+
+def test_strict_worker_records_failed_and_revalidated_package_fingerprints(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Audit events must distinguish an old invalid package from its repair."""
+    artifact_dir = agent_artifact_dir(tmp_path, "backtester")
+    artifact_dir.mkdir(parents=True)
+    _write_config(
+        artifact_dir,
+        {
+            "symbol": "XAUUSD_o",
+            "source": "mt5",
+            "start_date": "2026-08-20",
+            "end_date": "2026-09-07",
+        },
+    )
+    (artifact_dir / "code").mkdir()
+    (artifact_dir / "code" / "signal_engine.py").write_text(
+        "class SignalEngine: pass\n", encoding="utf-8"
+    )
+    llm = _PackageMutatingWorkerLLM(
+        [
+            LLMResponse(tool_calls=[ToolCallRequest(id="invalid", name="backtest", arguments={})]),
+            LLMResponse(tool_calls=[ToolCallRequest(id="repaired", name="backtest", arguments={})]),
+            LLMResponse(content="The repaired package was delegated once."),
+        ],
+        before_response={2: lambda: _write_config(artifact_dir, _valid_config())},
+    )
+    events = []
+
+    _run_strict_worker(
+        monkeypatch,
+        tmp_path,
+        llm,
+        _BacktestSpyTool(),
+        event_callback=events.append,
+    )
+
+    results = [
+        event.data
+        for event in events
+        if event.type == "tool_result" and event.data.get("tool") == "backtest"
+    ]
+    assert [result["preflight_status"] for result in results] == ["failed", "revalidated"]
+    assert results[0]["preflight_fingerprint"] != results[1]["preflight_fingerprint"]
+
+
 def test_strict_worker_emits_tool_result_for_every_preflight_block(monkeypatch, tmp_path: Path) -> None:
     """Both blocked backtest calls must leave auditable error events."""
     artifact_dir = agent_artifact_dir(tmp_path, "backtester")
@@ -469,6 +671,10 @@ def test_strict_worker_emits_tool_result_for_every_preflight_block(monkeypatch, 
         "invalid_backtest_config_identity",
         "strict_backtest_preflight_already_failed",
     ]
+    assert results[1]["original_error_code"] == "invalid_backtest_config_identity"
+    assert results[1]["preflight_fingerprint"] == results[0]["preflight_fingerprint"]
+    assert results[1]["original_failure_fingerprint"] == results[0]["preflight_fingerprint"]
+    assert results[1]["suppression_code"] == "strict_backtest_preflight_already_failed"
 
 
 def test_strict_worker_valid_package_delegates_backtest_once(monkeypatch, tmp_path: Path) -> None:
