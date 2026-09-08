@@ -907,14 +907,21 @@ def _run_worker_impl(
         else None
     )
     if strict_backtest_bundle is not None:
+        strategy_source = strict_backtest_bundle.strategy_source
         messages.append(
             {
                 "role": "system",
                 "content": (
                     "[SERVER STRICT BACKTEST BUNDLE] Use only codes="
                     f"{list(strict_backtest_bundle.codes)!r}, source={strict_backtest_bundle.source!r}; "
-                    "write config.json and code/signal_engine.py. The strategy source is "
-                    f"{strict_backtest_bundle.strategy_source.status}."
+                    "write config.json and code/signal_engine.py. "
+                    "Authoritative strategy source contract: "
+                    f"status={strategy_source.status!r}, path={strategy_source.materialized_path!r}, "
+                    f"evidence_ref={strategy_source.evidence_ref!r}, sha256={strategy_source.content_hash!r}. "
+                    "Read and use strategy_source.txt before constructing the strategy package. "
+                    "Raw uploads/...pdf paths and upstream prose are not authoritative strategy sources "
+                    "and must not be used as the basis for the package. If strategy_source.txt cannot be "
+                    "read, stop with required_strategy_source_unavailable and do not call backtest."
                 ),
             }
         )
