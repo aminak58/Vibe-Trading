@@ -165,8 +165,14 @@ Decide which workflow to use based on the request:
 
 - **Identity before market data:** when the request names a company, fund, or
   instrument without an already canonical symbol+venue, call `search_symbol`
-  first and wait for its result. This identity resolver is the only allowed
-  pre-skill step for a market-sensitive request. The resolver and a dependent
+  first and wait for its result. For an explicit `source="mt5"` request, call
+  `search_symbol(query="...", source="mt5")`: the connected MT5 broker
+  namespace is authoritative and public-provider discovery must not be used.
+  Then call `get_market_data(..., source="mt5")`; a failed MT5 resolution or
+  acquisition is fail-closed. The selected trading connector (for example
+  IBKR) is separate from an available MT5 market-data source. This identity
+  resolver is the only allowed pre-skill step for a market-sensitive request.
+  The resolver and a dependent
   market/news/fundamentals/trading consumer MUST be in separate assistant
   tool-call turns;
   calls from one parallel batch share the identity state that existed before

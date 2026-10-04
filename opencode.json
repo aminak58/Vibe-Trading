@@ -1,0 +1,38 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "metaeditor": {
+      "type": "remote",
+      "url": "http://127.0.0.1:22345/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer AQW8wI5WupHBoYH3RR3cxoXVe8+9mxNl+jF4E/kRbz"
+      }
+    },
+    "terminal": {
+      "type": "remote",
+      "url": "http://127.0.0.1:22346/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer AQW8wI5WupHBoYH3RR3cxoXVe8+9mxNl+jF4E/kRbz"
+      }
+    },
+    "marketdata": {
+      "type": "remote",
+      "url": "https://www.metatrader.com/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer mq-ee4c9d09b596fb5f86dbc3cd5ac62307"
+      }
+    },
+    "mtcustom2": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8900/mcp",
+      "enabled": true,
+      "oauth": false
+    }
+  }
+}

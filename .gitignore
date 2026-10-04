@@ -118,3 +118,7 @@ bench_report.json
 # Grounding ledger persisted by ad-hoc verification scripts into tests/
 agent/tests/artifacts/
 .idea/*
+
+# CodeCortex local tool cache (index/memory/runtime)
+.codecortex/
+agent/.codecortex/
